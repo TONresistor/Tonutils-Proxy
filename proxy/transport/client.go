@@ -343,6 +343,13 @@ func (t *Transport) RoundTrip(request *http.Request) (_ *http.Response, err erro
 	if rldpClient != nil {
 		resp, err := t.doRldpHttp(rldpClient, host, request)
 		if err != nil {
+			// Invalidate the cached RLDP connection so the next request
+			// reconnects instead of reusing a dead connection.
+			site.mx.Lock()
+			if act, ok := site.Actor.(*rldpInfo); ok {
+				act.destroyClient(rldpClient)
+			}
+			site.mx.Unlock()
 			return nil, fmt.Errorf("failed to request rldp-http site: %w", err)
 		}
 		atomic.StoreInt64(&site.LastSuccess, time.Now().Unix())
@@ -358,10 +365,7 @@ func (t *Transport) RoundTrip(request *http.Request) (_ *http.Response, err erro
 }
 
 func (t *Transport) doTorrent(bag *bagInfo, request *http.Request, si *siteInfo) (*http.Response, error) {
-	fileName := request.URL.Path
-	if strings.HasPrefix(fileName, "/") {
-		fileName = fileName[1:]
-	}
+	fileName := strings.TrimPrefix(request.URL.Path, "/")
 
 	if fileName == "" {
 		fileName = "index.html"

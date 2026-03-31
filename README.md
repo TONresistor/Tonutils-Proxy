@@ -94,3 +94,9 @@ go build -o ton-proxy cmd/proxy-cli/main.go
 Done!
 
 To build GUI version you need [Wails](https://wails.io/).
+
+---
+
+## WebSocket-ADNL Bridge
+
+This fork adds a WebSocket bridge that exposes the TON P2P network to web applications. See [WSBRIDGE.md](WSBRIDGE.md) for documentation.

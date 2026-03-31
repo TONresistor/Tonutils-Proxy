@@ -86,8 +86,6 @@ func (d *dataStreamer) FlushReader() {
 	case d.parts <- nil:
 	case <-d.closer:
 	}
-
-	return
 }
 
 func (d *dataStreamer) Write(data []byte) (int, error) {

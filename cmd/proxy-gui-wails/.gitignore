@@ -1,5 +1,0 @@
-build/bin
-node_modules
-frontend/dist
-mac_build
-GUI.Mac*

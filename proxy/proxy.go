@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,7 +15,10 @@ import (
 	"github.com/xssnick/tonutils-go/adnl"
 	adnlAddress "github.com/xssnick/tonutils-go/adnl/address"
 	"github.com/xssnick/tonutils-go/adnl/dht"
+	"github.com/xssnick/tonutils-go/adnl/keys"
+	"github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/liteclient"
+	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/ton/dns"
@@ -222,20 +226,33 @@ func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.
 
 	var gate *adnl.Gateway
 	var netMgr adnl.NetManager
-	if tunCfg != nil && tunCfg.NodesPoolConfigPath != "" {
+	if tunCfg != nil && (tunCfg.NodesPoolConfigPath != "" || tunCfg.TunnelSectionsNum >= 2) {
 		report(State{
 			Type:  "loading",
 			State: "Preparing ADNL tunnel...",
 		})
 
-		data, err := os.ReadFile(tunCfg.NodesPoolConfigPath)
-		if err != nil {
-			return fmt.Errorf("failed to load tunnel nodes pool config: %w", err)
+		var tunNodesCfg tunnelConfig.SharedConfig
+
+		// Load nodes from file if configured (backwards-compatible)
+		if tunCfg.NodesPoolConfigPath != "" {
+			data, err := os.ReadFile(tunCfg.NodesPoolConfigPath)
+			if err != nil {
+				log.Warn().Err(err).Msg("Failed to load tunnel nodes pool file, falling back to DHT discovery")
+			} else if err = json.Unmarshal(data, &tunNodesCfg); err != nil {
+				log.Warn().Err(err).Msg("Failed to parse tunnel nodes pool file, falling back to DHT discovery")
+			}
 		}
 
-		var tunNodesCfg tunnelConfig.SharedConfig
-		if err = json.Unmarshal(data, &tunNodesCfg); err != nil {
-			return fmt.Errorf("failed to parse tunnel nodes pool config: %w", err)
+		// If pool is empty, discover tunnel relays from DHT
+		if len(tunNodesCfg.NodesPool) == 0 {
+			log.Info().Msg("Discovering tunnel relay nodes from DHT...")
+			discovered := discoverTunnelNodes(lsCfg)
+			if len(discovered) == 0 {
+				return fmt.Errorf("no tunnel relay nodes found via DHT")
+			}
+			tunNodesCfg.NodesPool = discovered
+			log.Info().Int("count", len(discovered)).Msg("Tunnel relay nodes discovered from DHT")
 		}
 
 		if customTunNetCfg == nil {
@@ -431,7 +448,9 @@ func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.
 
 	go func() {
 		<-ctx.Done()
-		server.Shutdown(ctx)
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		server.Shutdown(shutCtx)
 	}()
 
 	failed := false
@@ -479,7 +498,6 @@ func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.
 func initDNSResolver(cfg *liteclient.GlobalConfig) (*liteclient.ConnectionPool, *dns.Client, error) {
 	pool := liteclient.NewConnectionPool()
 
-	// connect to testnet lite server
 	err := pool.AddConnectionsFromConfig(context.Background(), cfg)
 	if err != nil {
 		return nil, nil, err
@@ -503,4 +521,80 @@ func initDNSResolver(cfg *liteclient.GlobalConfig) (*liteclient.ConnectionPool, 
 	}
 
 	return pool, dns.NewDNSClient(api, root), nil
+}
+
+// discoverTunnelNodes creates a temporary DHT client, queries for tunnel relay
+// nodes, and returns them as TunnelRouteSection entries ready for adnl-tunnel.
+func discoverTunnelNodes(netCfg *liteclient.GlobalConfig) []tunnelConfig.TunnelRouteSection {
+	// Create a temporary ADNL gateway + DHT client for discovery
+	_, tmpKey, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to generate temp DHT key")
+		return nil
+	}
+	tmpGate := adnl.NewGateway(tmpKey)
+	if err := tmpGate.StartClient(); err != nil {
+		log.Error().Err(err).Msg("Failed to start temp DHT gateway")
+		return nil
+	}
+	defer tmpGate.Close()
+
+	dhtClient, err := dht.NewClientFromConfig(tmpGate, netCfg)
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to create temp DHT client")
+		return nil
+	}
+	defer dhtClient.Close()
+	// Compute the tunnel overlay key: tl.Hash(OverlayKey{PaymentNode: [0...0]})
+	// Compute the tunnel overlay key for free relay nodes
+	overlayKey, err := tl.Hash(tunnel.OverlayKey{PaymentNode: make([]byte, 32)})
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to compute tunnel overlay key")
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	var allNodes []overlay.Node
+	var cont *dht.Continuation
+
+	// Query with continuation to get as many nodes as possible
+	for i := 0; i < 3; i++ {
+		nodesList, c, err := dhtClient.FindOverlayNodes(ctx, overlayKey, cont)
+		if err != nil {
+			if i == 0 {
+				log.Warn().Err(err).Msg("DHT tunnel relay discovery failed")
+				return nil
+			}
+			break
+		}
+		if nodesList != nil {
+			allNodes = append(allNodes, nodesList.List...)
+		}
+		if c == nil {
+			break
+		}
+		cont = c
+	}
+
+	// Deduplicate by public key and convert to TunnelRouteSection
+	seen := make(map[string]bool)
+	var sections []tunnelConfig.TunnelRouteSection
+	for _, node := range allNodes {
+		id, ok := node.ID.(keys.PublicKeyED25519)
+		if !ok {
+			continue
+		}
+		keyHex := hex.EncodeToString(id.Key)
+		if seen[keyHex] {
+			continue
+		}
+		seen[keyHex] = true
+		sections = append(sections, tunnelConfig.TunnelRouteSection{
+			Key: id.Key,
+		})
+	}
+
+	return sections
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/xssnick/tonutils-go/liteclient"
+	"github.com/xssnick/tonutils-proxy/cmd/proxy-cli/config"
 	"github.com/xssnick/tonutils-proxy/proxy"
 	"log"
 )
@@ -44,7 +45,7 @@ func StopProxy() *C.char {
 	return C.CString("OK")
 }
 
-func startProxy(port uint16, cfg *liteclient.GlobalConfig) string {
+func startProxy(port uint16, netCfg *liteclient.GlobalConfig) string {
 	select {
 	case <-ActiveProxy.Done():
 	default:
@@ -53,13 +54,27 @@ func startProxy(port uint16, cfg *liteclient.GlobalConfig) string {
 
 	ActiveProxy, ProxyStopper = context.WithCancel(context.Background())
 
+	// Load config.json from CWD (same as CLI)
+	cfg, err := config.LoadConfig("./")
+	if err != nil {
+		log.Println("failed to load config:", err.Error())
+		return "ERR: " + err.Error()
+	}
+
+	var customTunNetCfg *liteclient.GlobalConfig
+	if cfg.CustomTunnelNetworkConfigPath != "" {
+		customTunNetCfg, err = liteclient.GetConfigFromFile(cfg.CustomTunnelNetworkConfigPath)
+		if err != nil {
+			log.Println("failed to load custom net config for tun:", err.Error())
+		}
+	}
+
 	var ch = make(chan proxy.State, 1)
-	var err error
 	go func() {
-		if cfg != nil {
-			err = proxy.RunProxyWithConfig(ActiveProxy, "127.0.0.1:"+fmt.Sprint(port), nil, nil, false, "LIB "+GitCommit, cfg, nil, nil)
+		if netCfg != nil {
+			err = proxy.RunProxyWithConfig(ActiveProxy, "127.0.0.1:"+fmt.Sprint(port), cfg.ADNLKey, ch, false, "LIB "+GitCommit, netCfg, cfg.TunnelConfig, customTunNetCfg)
 		} else {
-			err = proxy.RunProxy(ActiveProxy, "127.0.0.1:"+fmt.Sprint(port), nil, ch, "LIB "+GitCommit, false, "", nil, nil)
+			err = proxy.RunProxy(ActiveProxy, "127.0.0.1:"+fmt.Sprint(port), cfg.ADNLKey, ch, "LIB "+GitCommit, false, "", cfg.TunnelConfig, customTunNetCfg)
 		}
 		if err != nil {
 			log.Println("failed to start proxy:", err.Error())
@@ -74,18 +89,20 @@ func startProxy(port uint16, cfg *liteclient.GlobalConfig) string {
 			case <-ActiveProxy.Done():
 				return
 			case state := <-ch:
-				var msg string
 				if state.Stopped {
 					ProxyStopper()
-					msg = "ERR: " + state.State
+					select {
+					case res <- "ERR: " + state.State:
+					default:
+					}
+					return
 				} else if state.Type == "ready" {
-					msg = "OK"
+					select {
+					case res <- "OK":
+					default:
+					}
 				}
-
-				select {
-				case res <- msg:
-				default:
-				}
+				// "loading" states are ignored — keep waiting
 			}
 		}
 	}()

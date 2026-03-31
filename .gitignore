@@ -1,8 +1,8 @@
-build/cli
-build/gui
-build/lib
+build/
 .DS_Store
 .idea
 proxy/window
 *.json
+!*.json.example
 payments-db
+/proxy-cli
