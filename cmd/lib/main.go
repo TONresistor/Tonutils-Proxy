@@ -69,12 +69,26 @@ func startProxy(port uint16, netCfg *liteclient.GlobalConfig) string {
 		}
 	}
 
+	var multiChainCfg *proxy.MultiChainConfig
+	if cfg.Resolver != nil {
+		multiChainCfg = &proxy.MultiChainConfig{
+			RPCOverrides: make(map[string]string),
+			Disabled:     make(map[string]bool),
+		}
+		for k, v := range cfg.Resolver.RPCOverrides {
+			multiChainCfg.RPCOverrides[k] = v
+		}
+		for _, tld := range cfg.Resolver.Disabled {
+			multiChainCfg.Disabled[tld] = true
+		}
+	}
+
 	var ch = make(chan proxy.State, 1)
 	go func() {
 		if netCfg != nil {
-			err = proxy.RunProxyWithConfig(ActiveProxy, "127.0.0.1:"+fmt.Sprint(port), cfg.ADNLKey, ch, false, "LIB "+GitCommit, netCfg, cfg.TunnelConfig, customTunNetCfg)
+			err = proxy.RunProxyWithConfig(ActiveProxy, "127.0.0.1:"+fmt.Sprint(port), cfg.ADNLKey, ch, false, "LIB "+GitCommit, netCfg, cfg.TunnelConfig, customTunNetCfg, multiChainCfg)
 		} else {
-			err = proxy.RunProxy(ActiveProxy, "127.0.0.1:"+fmt.Sprint(port), cfg.ADNLKey, ch, "LIB "+GitCommit, false, "", cfg.TunnelConfig, customTunNetCfg)
+			err = proxy.RunProxy(ActiveProxy, "127.0.0.1:"+fmt.Sprint(port), cfg.ADNLKey, ch, "LIB "+GitCommit, false, "", cfg.TunnelConfig, customTunNetCfg, multiChainCfg)
 		}
 		if err != nil {
 			log.Println("failed to start proxy:", err.Error())

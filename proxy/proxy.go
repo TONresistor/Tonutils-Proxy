@@ -23,6 +23,7 @@ import (
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/ton/dns"
 	"github.com/xssnick/tonutils-proxy/proxy/transport"
+	"github.com/xssnick/tonutils-proxy/resolver"
 	"github.com/xssnick/tonutils-storage/config"
 	"github.com/xssnick/tonutils-storage/storage"
 	"io"
@@ -72,8 +73,9 @@ func appendHostToXForwardHeader(header http.Header, host string) {
 }
 
 type proxy struct {
-	version   string
-	blockHttp bool
+	version       string
+	blockHttp     bool
+	multiResolver *resolver.MultiResolver
 }
 
 var client *http.Client
@@ -109,6 +111,18 @@ func (p *proxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 		appendHostToXForwardHeader(req.Header, clientIP)
 	}
 	req.Header.Set("X-Tonutils-Proxy", p.version)
+
+	// Resolve multi-chain domains (e.g. .eth) to .adnl before routing
+	if p.multiResolver != nil && p.multiResolver.Supports(req.Host) {
+		newHost, err := p.multiResolver.ResolveToADNL(req.Host)
+		if err != nil {
+			http.Error(wr, fmt.Sprintf("Failed to resolve %s: %v", req.Host, err), http.StatusBadGateway)
+			return
+		}
+		log.Debug().Str("domain", req.Host).Str("adnl", newHost).Msg("multi-chain resolved")
+		req.Host = newHost
+		req.URL.Host = newHost
+	}
 
 	var c = http.DefaultClient
 	if strings.HasSuffix(req.Host, ".ton") || strings.HasSuffix(req.Host, ".adnl") ||
@@ -153,7 +167,15 @@ type State struct {
 	Stopped bool
 }
 
-func RunProxy(closerCtx context.Context, addr string, adnlKey ed25519.PrivateKey, res chan<- State, versionAndDevice string, blockHttp bool, netConfigPath string, tunCfg *tunnelConfig.ClientConfig, customTunNetCfg *liteclient.GlobalConfig) error {
+// MultiChainConfig holds configuration for multi-blockchain domain resolution.
+type MultiChainConfig struct {
+	// RPCOverrides maps TLD (e.g. ".eth") to a custom RPC URL.
+	RPCOverrides map[string]string
+	// Disabled is a set of TLDs to skip (e.g. ".eth" → true).
+	Disabled map[string]bool
+}
+
+func RunProxy(closerCtx context.Context, addr string, adnlKey ed25519.PrivateKey, res chan<- State, versionAndDevice string, blockHttp bool, netConfigPath string, tunCfg *tunnelConfig.ClientConfig, customTunNetCfg *liteclient.GlobalConfig, multiChainCfg *MultiChainConfig) error {
 	if res != nil {
 		res <- State{
 			Type:  "loading",
@@ -181,7 +203,7 @@ func RunProxy(closerCtx context.Context, addr string, adnlKey ed25519.PrivateKey
 		}
 	}
 
-	return RunProxyWithConfig(closerCtx, addr, adnlKey, res, blockHttp, versionAndDevice, lsCfg, tunCfg, customTunNetCfg)
+	return RunProxyWithConfig(closerCtx, addr, adnlKey, res, blockHttp, versionAndDevice, lsCfg, tunCfg, customTunNetCfg, multiChainCfg)
 }
 
 var OnTunnel = func(addr string) {}
@@ -194,7 +216,7 @@ var OnAskReroute = func() bool { return false }
 
 var OnTunnelStopped = func() {}
 
-func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.PrivateKey, res chan<- State, blockHttp bool, versionAndDevice string, lsCfg *liteclient.GlobalConfig, tunCfg *tunnelConfig.ClientConfig, customTunNetCfg *liteclient.GlobalConfig) error {
+func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.PrivateKey, res chan<- State, blockHttp bool, versionAndDevice string, lsCfg *liteclient.GlobalConfig, tunCfg *tunnelConfig.ClientConfig, customTunNetCfg *liteclient.GlobalConfig, multiChainCfg *MultiChainConfig) error {
 	report := func(s State) {
 		if res != nil {
 			res <- s
@@ -223,6 +245,24 @@ func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.
 		return fmt.Errorf("failed to init TON DNS resolver: %w", err)
 	}
 	defer connPool.Stop()
+
+	// Initialize multi-chain resolver (ENS, etc.)
+	var multiRes *resolver.MultiResolver
+	var warnings []string
+	if multiChainCfg != nil {
+		multiRes, warnings = resolver.InitAll(multiChainCfg.RPCOverrides, multiChainCfg.Disabled)
+	} else {
+		multiRes, warnings = resolver.InitAll(nil, nil)
+	}
+	for _, w := range warnings {
+		log.Warn().Str("warning", w).Msg("chain resolver init failed")
+	}
+	if tlds := multiRes.EnabledTLDs(); len(tlds) > 0 {
+		log.Info().Strs("tlds", tlds).Msg("Multi-chain resolver initialized")
+	} else {
+		log.Warn().Msg("No multi-chain resolvers available, only TON domains will work")
+	}
+	defer multiRes.Close()
 
 	var gate *adnl.Gateway
 	var netMgr adnl.NetManager
@@ -444,7 +484,7 @@ func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.
 
 	log.Info().Str("address", addr).Msg("Starting proxy server")
 
-	server := http.Server{Addr: addr, Handler: &proxy{blockHttp: blockHttp, version: versionAndDevice}}
+	server := http.Server{Addr: addr, Handler: &proxy{blockHttp: blockHttp, version: versionAndDevice, multiResolver: multiRes}}
 
 	go func() {
 		<-ctx.Done()

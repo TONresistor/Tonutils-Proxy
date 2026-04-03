@@ -8,12 +8,19 @@ import (
 	"sync"
 )
 
+type ResolverConfig struct {
+	RPCOverrides map[string]string `json:"RPCOverrides,omitempty"`
+	Disabled     []string          `json:"Disabled,omitempty"`
+}
+
 type Config struct {
 	Version uint
 	ADNLKey []byte
 
 	CustomTunnelNetworkConfigPath string
 	TunnelConfig                  *tunnelConfig.ClientConfig
+
+	Resolver *ResolverConfig `json:"Resolver,omitempty"`
 
 	mx sync.Mutex
 }

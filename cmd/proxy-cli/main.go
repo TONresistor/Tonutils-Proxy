@@ -21,6 +21,10 @@ func main() {
 	var blockHttp = flag.Bool("no-http", false, "Block ordinary http requests")
 	var networkConfigPath = flag.String("global-config", "", "path to ton network config file")
 	var tunnelSections = flag.Int("tunnel", 0, "Number of tunnel sections (0=direct, 2+=tunnel with DHT relay discovery)")
+	var ethRPC = flag.String("eth-rpc", "", "Custom Ethereum RPC endpoint for ENS resolution")
+	var noEth = flag.Bool("no-eth", false, "Disable .eth domain resolution")
+	var solRPC = flag.String("sol-rpc", "", "Custom Solana RPC endpoint for SNS resolution")
+	var noSol = flag.Bool("no-sol", false, "Disable .sol domain resolution")
 
 	flag.Parse()
 
@@ -72,8 +76,37 @@ func main() {
 		proxy.OnTunnelStopped = cancel
 	}
 
+	// Build multi-chain resolver config: config file as base, CLI flags override
+	var multiChainCfg *proxy.MultiChainConfig
+	if cfg.Resolver != nil || *ethRPC != "" || *noEth || *solRPC != "" || *noSol {
+		multiChainCfg = &proxy.MultiChainConfig{
+			RPCOverrides: make(map[string]string),
+			Disabled:     make(map[string]bool),
+		}
+		if cfg.Resolver != nil {
+			for k, v := range cfg.Resolver.RPCOverrides {
+				multiChainCfg.RPCOverrides[k] = v
+			}
+			for _, tld := range cfg.Resolver.Disabled {
+				multiChainCfg.Disabled[tld] = true
+			}
+		}
+		if *ethRPC != "" {
+			multiChainCfg.RPCOverrides[".eth"] = *ethRPC
+		}
+		if *noEth {
+			multiChainCfg.Disabled[".eth"] = true
+		}
+		if *solRPC != "" {
+			multiChainCfg.RPCOverrides[".sol"] = *solRPC
+		}
+		if *noSol {
+			multiChainCfg.Disabled[".sol"] = true
+		}
+	}
+
 	go func() {
-		err = proxy.RunProxy(closerCtx, *addr, cfg.ADNLKey, nil, "CLI "+GitCommit, *blockHttp, *networkConfigPath, cfg.TunnelConfig, customTinNetCfg)
+		err = proxy.RunProxy(closerCtx, *addr, cfg.ADNLKey, nil, "CLI "+GitCommit, *blockHttp, *networkConfigPath, cfg.TunnelConfig, customTinNetCfg, multiChainCfg)
 		if err != nil {
 			log.Fatal().Err(err).Msg("proxy failed")
 		}

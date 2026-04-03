@@ -86,17 +86,27 @@ Lets try to connect to some ton site, for example http://foundation.ton/
 [ton-svg]: https://img.shields.io/badge/Based%20on-TON-blue
 [ton]: https://ton.org
 
+## Multi-Chain Domain Resolution
+
+This fork resolves domains from multiple blockchains to TON Sites via ADNL addresses.
+
+| Chain | TLD | Name Service | Resolution |
+|---|---|---|---|
+| TON | `.ton`, `.adnl`, `.t.me` | TON DNS | Native |
+| Ethereum | `.eth` | [ENS](https://ens.domains/) | On-chain L1, text record `adnl` |
+| Solana | `.sol` | [SNS](https://www.sns.id/) | On-chain, TXT record (V2 + V1 fallback) |
+
+Set a text record `adnl` with your 64-char hex ADNL address on your `.eth` or `.sol` domain to link it to a TON Site.
+
+```bash
+./proxy-cli                                        # all chains, public RPCs
+./proxy-cli --eth-rpc https://your-rpc.com         # custom RPC
+./proxy-cli --no-sol                               # disable a chain
+```
+
+RPC overrides and disabled chains persist in `config.json` under the `Resolver` key.
+
 ### How to build from sources
-CLI version has no external dependencies, just [tonutils](https://github.com/xssnick/tonutils-go) and pure Go 🤘
  ```
 go build -o ton-proxy cmd/proxy-cli/main.go
  ```
-Done!
-
-To build GUI version you need [Wails](https://wails.io/).
-
----
-
-## WebSocket-ADNL Bridge
-
-This fork adds a WebSocket bridge that exposes the TON P2P network to web applications. See [WSBRIDGE.md](WSBRIDGE.md) for documentation.
