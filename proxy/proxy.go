@@ -609,25 +609,44 @@ func discoverTunnelNodes(netCfg *liteclient.GlobalConfig) []tunnelConfig.TunnelR
 	defer cancel()
 
 	var allNodes []overlay.Node
-	var cont *dht.Continuation
+	var lastErr error
 
-	// Query with continuation to get as many nodes as possible
-	for i := 0; i < 3; i++ {
-		nodesList, c, err := dhtClient.FindOverlayNodes(ctx, overlayKey, cont)
-		if err != nil {
-			if i == 0 {
-				log.Warn().Err(err).Msg("DHT tunnel relay discovery failed")
+	// Retry with exponential backoff (2s, 4s, 8s). DHT may not be ready at startup.
+	backoff := 2 * time.Second
+	for attempt := 0; attempt < 4; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-time.After(backoff):
+				backoff *= 2
+			case <-ctx.Done():
 				return nil
 			}
+		}
+
+		var cont *dht.Continuation
+		for i := 0; i < 3; i++ {
+			nodesList, c, err := dhtClient.FindOverlayNodes(ctx, overlayKey, cont)
+			if err != nil {
+				lastErr = err
+				break
+			}
+			if nodesList != nil {
+				allNodes = append(allNodes, nodesList.List...)
+			}
+			if c == nil {
+				break
+			}
+			cont = c
+		}
+
+		if len(allNodes) > 0 {
 			break
 		}
-		if nodesList != nil {
-			allNodes = append(allNodes, nodesList.List...)
-		}
-		if c == nil {
-			break
-		}
-		cont = c
+	}
+
+	if len(allNodes) == 0 {
+		log.Warn().Err(lastErr).Msg("DHT tunnel relay discovery failed after retries")
+		return nil
 	}
 
 	// Deduplicate by public key and convert to TunnelRouteSection
