@@ -32,6 +32,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -87,7 +88,8 @@ func (p *proxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 	}
 
 	if req.Method == "CONNECT" {
-		wr.WriteHeader(http.StatusOK)
+		log.Debug().Str("host", req.Host).Msg("CONNECT not supported")
+		http.Error(wr, "CONNECT not supported", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -113,13 +115,21 @@ func (p *proxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 	req.Header.Set("X-Tonutils-Proxy", p.version)
 
 	// Resolve multi-chain domains (e.g. .eth) to .adnl before routing
-	if p.multiResolver != nil && p.multiResolver.Supports(req.Host) {
-		newHost, err := p.multiResolver.ResolveToADNL(req.Host)
+	host := req.Host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	if len(host) > 253 {
+		http.Error(wr, "invalid host", http.StatusBadRequest)
+		return
+	}
+	if p.multiResolver != nil && p.multiResolver.Supports(host) {
+		newHost, err := p.multiResolver.ResolveToADNL(host)
 		if err != nil {
-			http.Error(wr, fmt.Sprintf("Failed to resolve %s: %v", req.Host, err), http.StatusBadGateway)
+			http.Error(wr, fmt.Sprintf("Failed to resolve %s: %v", host, err), http.StatusBadGateway)
 			return
 		}
-		log.Debug().Str("domain", req.Host).Str("adnl", newHost).Msg("multi-chain resolved")
+		log.Debug().Str("domain", host).Str("adnl", newHost).Msg("multi-chain resolved")
 		req.Host = newHost
 		req.URL.Host = newHost
 	}
@@ -158,7 +168,9 @@ func (p *proxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 
 	copyHeader(wr.Header(), resp.Header)
 	wr.WriteHeader(resp.StatusCode)
-	io.Copy(wr, resp.Body)
+	if _, err := io.Copy(wr, io.LimitReader(resp.Body, 100<<20)); err != nil {
+		log.Debug().Err(err).Str("url", req.URL.String()).Msg("response copy interrupted")
+	}
 }
 
 type State struct {
@@ -493,11 +505,11 @@ func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.
 		server.Shutdown(shutCtx)
 	}()
 
-	failed := false
+	var failed atomic.Bool
 	go func() {
 		// wait for server start
 		time.Sleep(1 * time.Second)
-		if failed {
+		if failed.Load() {
 			return
 		}
 
@@ -513,7 +525,7 @@ func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.
 	}
 
 	if err != nil {
-		failed = true
+		failed.Store(true)
 		if strings.Contains(err.Error(), "address already in use") {
 			err = fmt.Errorf("cannot start server, port %s is already in use by another application", addr)
 		}

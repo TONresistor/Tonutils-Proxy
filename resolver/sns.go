@@ -21,6 +21,8 @@ const (
 	snsTXTRecord    = "TXT"
 	snsV1Prefix     = "\x01"
 	snsV2Prefix     = "\x02"
+
+	snsV2HeaderSize = 8 // stalenessType(2) + roaType(2) + contentLen(4)
 )
 
 func init() {
@@ -52,13 +54,15 @@ func newSNSResolver(rpcURL string) (*SNSResolver, error) {
 	}
 
 	cfg := findChainConfig(".sol")
+	var lastErr error
 	for _, url := range cfg.DefaultRPCs {
 		client, err := dialAndVerifySolana(url)
 		if err == nil {
 			return &SNSResolver{client: client}, nil
 		}
+		lastErr = err
 	}
-	return nil, fmt.Errorf("no working Solana RPC found")
+	return nil, fmt.Errorf("no working Solana RPC found: %w", lastErr)
 }
 
 func (r *SNSResolver) Resolve(domain string) (string, error) {
@@ -132,6 +136,9 @@ func extractADNLFromV1Record(data []byte, domain string) (string, error) {
 	}
 
 	payload := data[nameRegistryHeaderSize:]
+	if len(payload) > 256 {
+		payload = payload[:256]
+	}
 	return parseADNLFromPayload(payload, domain)
 }
 
@@ -144,7 +151,7 @@ func extractADNLFromV1Record(data []byte, domain string) (string, error) {
 //   - RoA ID:                    variable (32 bytes when type > 0, 0 when type=0)
 //   - Content:                   Content-Length bytes
 func extractADNLFromV2Record(data []byte, domain string) (string, error) {
-	if len(data) <= nameRegistryHeaderSize+8 {
+	if len(data) <= nameRegistryHeaderSize+snsV2HeaderSize {
 		return "", fmt.Errorf("empty V2 record for %q", domain)
 	}
 
@@ -158,7 +165,7 @@ func extractADNLFromV2Record(data []byte, domain string) (string, error) {
 		return "", fmt.Errorf("V2 contentLen too large for %q: %d", domain, contentLen)
 	}
 
-	offset := uint32(8)
+	offset := uint32(snsV2HeaderSize)
 
 	// Skip staleness validation data
 	switch stalenessType {
@@ -188,6 +195,7 @@ func extractADNLFromV2Record(data []byte, domain string) (string, error) {
 func parseADNLFromPayload(payload []byte, domain string) (string, error) {
 	adnlHex := strings.TrimSpace(string(payload))
 	adnlHex = strings.TrimRight(adnlHex, "\x00")
+	// Trim trailing dashes observed in some SNS V2 TXT records (encoding artifact)
 	adnlHex = strings.Trim(adnlHex, "-")
 	adnlHex = strings.TrimPrefix(adnlHex, "0x")
 	adnlHex = strings.TrimPrefix(adnlHex, "0X")

@@ -2,8 +2,10 @@ package resolver
 
 import (
 	"encoding/hex"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 const testADNLHex = "b1b408ed6d2b664488336aa428d258ddce44683a730aff11d7ccf785f5e74a89"
@@ -180,5 +182,73 @@ func TestResolveToADNLCache(t *testing.T) {
 
 	if mock.calls != 1 {
 		t.Errorf("expected mock called once (cache hit on 2nd call), got %d calls", mock.calls)
+	}
+}
+
+func TestResolveToADNLCacheExpiry(t *testing.T) {
+	m := NewMultiResolver()
+	defer m.Close()
+
+	mock := &mockResolver{result: testADNLHex}
+	m.Register(".test", mock)
+
+	// Injecter une entrée expirée dans le cache
+	m.cacheMu.Lock()
+	m.cacheMap["example.test"] = cacheEntry{
+		adnlHost:  "expired.adnl",
+		expiresAt: time.Now().Add(-time.Minute),
+	}
+	m.cacheMu.Unlock()
+
+	_, err := m.ResolveToADNL("example.test")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mock.calls != 1 {
+		t.Errorf("expected mock called once (cache expired), got %d calls", mock.calls)
+	}
+}
+
+func TestResolveToADNLBadHex(t *testing.T) {
+	// Hex invalide → erreur "invalid ADNL hex"
+	m := NewMultiResolver()
+	defer m.Close()
+	m.Register(".test", &mockResolver{result: "notvalidhex"})
+
+	_, err := m.ResolveToADNL("example.test")
+	if err == nil {
+		t.Fatal("expected error for invalid hex")
+	}
+	if !strings.Contains(err.Error(), "invalid ADNL hex") {
+		t.Errorf("expected 'invalid ADNL hex' in error, got: %v", err)
+	}
+
+	// Hex trop court (valide mais pas 32 octets) → erreur "expected 32 bytes"
+	m2 := NewMultiResolver()
+	defer m2.Close()
+	m2.Register(".test", &mockResolver{result: "aabb"})
+
+	_, err = m2.ResolveToADNL("example.test")
+	if err == nil {
+		t.Fatal("expected error for too-short hex")
+	}
+	if !strings.Contains(err.Error(), "expected 32 bytes") {
+		t.Errorf("expected 'expected 32 bytes' in error, got: %v", err)
+	}
+}
+
+func TestResolveToADNLErrorFromResolver(t *testing.T) {
+	m := NewMultiResolver()
+	defer m.Close()
+
+	sentinel := fmt.Errorf("resolution failed")
+	m.Register(".test", &mockResolver{err: sentinel})
+
+	_, err := m.ResolveToADNL("example.test")
+	if err == nil {
+		t.Fatal("expected error from resolver")
+	}
+	if !strings.Contains(err.Error(), "resolution failed") {
+		t.Errorf("expected propagated error, got: %v", err)
 	}
 }

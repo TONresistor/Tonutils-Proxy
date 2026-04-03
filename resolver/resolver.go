@@ -62,10 +62,11 @@ const maxCacheEntries = 10000
 
 // MultiResolver routes resolution to chain-specific resolvers based on TLD.
 type MultiResolver struct {
-	resolvers map[string]Resolver
-	cacheMu   sync.RWMutex
-	cacheMap  map[string]cacheEntry
-	done      chan struct{}
+	resolvers  map[string]Resolver
+	cacheMu    sync.RWMutex
+	cacheMap   map[string]cacheEntry
+	done       chan struct{}
+	closeOnce  sync.Once
 }
 
 func NewMultiResolver() *MultiResolver {
@@ -157,10 +158,12 @@ func (m *MultiResolver) EnabledTLDs() []string {
 }
 
 func (m *MultiResolver) Close() {
-	close(m.done)
-	for _, r := range m.resolvers {
-		r.Close()
-	}
+	m.closeOnce.Do(func() {
+		close(m.done)
+		for _, r := range m.resolvers {
+			r.Close()
+		}
+	})
 }
 
 // InitAll initializes all registered chain resolvers in parallel.
@@ -235,7 +238,9 @@ func (m *MultiResolver) ResolveToADNL(domain string) (string, error) {
 			return entry.adnlHost, nil
 		}
 		m.cacheMu.Lock()
-		delete(m.cacheMap, domain)
+		if e, still := m.cacheMap[domain]; still && time.Now().After(e.expiresAt) {
+			delete(m.cacheMap, domain)
+		}
 		m.cacheMu.Unlock()
 	}
 

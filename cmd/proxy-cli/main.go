@@ -11,6 +11,9 @@ import (
 	"github.com/xssnick/tonutils-proxy/proxy"
 	"os"
 	"os/signal"
+	"strings"
+	"syscall"
+	"time"
 )
 
 var GitCommit = "dev"
@@ -28,13 +31,13 @@ func main() {
 
 	flag.Parse()
 
-	if *tunnelSections == 1 {
-		log.Fatal().Msg("--tunnel requires at least 2 sections (use --tunnel 2 or higher)")
-	}
-
 	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stdout}).Level(zerolog.InfoLevel)
 	if *verbosity >= 3 {
 		log.Logger = log.Logger.Level(zerolog.DebugLevel)
+	}
+
+	if *tunnelSections == 1 {
+		log.Fatal().Msg("--tunnel requires at least 2 sections (use --tunnel 2 or higher)")
 	}
 
 	log.Info().Msg("Version:" + GitCommit)
@@ -105,6 +108,14 @@ func main() {
 		}
 	}
 
+	if multiChainCfg != nil {
+		for k := range multiChainCfg.RPCOverrides {
+			if !strings.HasPrefix(k, ".") {
+				log.Warn().Str("key", k).Msg("RPCOverrides key should start with dot, e.g. '." + k + "'")
+			}
+		}
+	}
+
 	go func() {
 		err = proxy.RunProxy(closerCtx, *addr, cfg.ADNLKey, nil, "CLI "+GitCommit, *blockHttp, *networkConfigPath, cfg.TunnelConfig, customTinNetCfg, multiChainCfg)
 		if err != nil {
@@ -113,14 +124,18 @@ func main() {
 	}()
 
 	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	<-c
 	stop()
 
 	log.Info().Msg("Received interrupt signal, shutting down...")
 	if tunnelEnabled {
 		log.Info().Msg("Waiting for tunnel to stop...")
-		<-tunnelCtx.Done()
+		select {
+		case <-tunnelCtx.Done():
+		case <-time.After(10 * time.Second):
+			log.Warn().Msg("Tunnel did not stop within timeout")
+		}
 	}
 	log.Info().Msg("Shutdown complete")
 }
