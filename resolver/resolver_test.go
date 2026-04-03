@@ -192,7 +192,7 @@ func TestResolveToADNLCacheExpiry(t *testing.T) {
 	mock := &mockResolver{result: testADNLHex}
 	m.Register(".test", mock)
 
-	// Injecter une entrée expirée dans le cache
+	// Inject an expired cache entry
 	m.cacheMu.Lock()
 	m.cacheMap["example.test"] = cacheEntry{
 		adnlHost:  "expired.adnl",
@@ -210,7 +210,7 @@ func TestResolveToADNLCacheExpiry(t *testing.T) {
 }
 
 func TestResolveToADNLBadHex(t *testing.T) {
-	// Hex invalide → erreur "invalid ADNL hex"
+	// Invalid hex → "invalid ADNL hex" error
 	m := NewMultiResolver()
 	defer m.Close()
 	m.Register(".test", &mockResolver{result: "notvalidhex"})
@@ -223,7 +223,7 @@ func TestResolveToADNLBadHex(t *testing.T) {
 		t.Errorf("expected 'invalid ADNL hex' in error, got: %v", err)
 	}
 
-	// Hex trop court (valide mais pas 32 octets) → erreur "expected 32 bytes"
+	// Too-short hex (valid but not 32 bytes) → "expected 32 bytes" error
 	m2 := NewMultiResolver()
 	defer m2.Close()
 	m2.Register(".test", &mockResolver{result: "aabb"})

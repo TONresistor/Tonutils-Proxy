@@ -611,7 +611,7 @@ func discoverTunnelNodes(netCfg *liteclient.GlobalConfig) []tunnelConfig.TunnelR
 	var allNodes []overlay.Node
 	var lastErr error
 
-	// Retry with exponential backoff (2s, 4s, 8s). DHT may not be ready at startup.
+	// Retry with exponential backoff (2s, 4s, 8s). Each attempt has a 30s timeout.
 	backoff := 2 * time.Second
 	for attempt := 0; attempt < 4; attempt++ {
 		if attempt > 0 {
@@ -623,9 +623,10 @@ func discoverTunnelNodes(netCfg *liteclient.GlobalConfig) []tunnelConfig.TunnelR
 			}
 		}
 
+		attemptCtx, attemptCancel := context.WithTimeout(ctx, 30*time.Second)
 		var cont *dht.Continuation
 		for i := 0; i < 3; i++ {
-			nodesList, c, err := dhtClient.FindOverlayNodes(ctx, overlayKey, cont)
+			nodesList, c, err := dhtClient.FindOverlayNodes(attemptCtx, overlayKey, cont)
 			if err != nil {
 				lastErr = err
 				break
@@ -638,6 +639,7 @@ func discoverTunnelNodes(netCfg *liteclient.GlobalConfig) []tunnelConfig.TunnelR
 			}
 			cont = c
 		}
+		attemptCancel()
 
 		if len(allNodes) > 0 {
 			break
