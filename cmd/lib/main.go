@@ -9,6 +9,7 @@ import (
 	"github.com/xssnick/tonutils-proxy/cmd/proxy-cli/config"
 	"github.com/xssnick/tonutils-proxy/proxy"
 	"log"
+	"time"
 )
 
 var GitCommit string
@@ -83,12 +84,23 @@ func startProxy(port uint16, netCfg *liteclient.GlobalConfig) string {
 		}
 	}
 
+	var connectCfg *proxy.ConnectConfig
+	if cfg.Connect != nil {
+		connectCfg = &proxy.ConnectConfig{
+			Enabled:      cfg.Connect.Enabled,
+			AllowedPorts: cfg.Connect.AllowedPorts,
+			MaxTunnels:   cfg.Connect.MaxTunnels,
+			DialTimeout:  time.Duration(cfg.Connect.DialTimeout) * time.Second,
+			IdleTimeout:  time.Duration(cfg.Connect.IdleTimeout) * time.Second,
+		}
+	}
+
 	var ch = make(chan proxy.State, 1)
 	go func() {
 		if netCfg != nil {
-			err = proxy.RunProxyWithConfig(ActiveProxy, "127.0.0.1:"+fmt.Sprint(port), cfg.ADNLKey, ch, false, "LIB "+GitCommit, netCfg, cfg.TunnelConfig, customTunNetCfg, multiChainCfg)
+			err = proxy.RunProxyWithConfig(ActiveProxy, "127.0.0.1:"+fmt.Sprint(port), cfg.ADNLKey, ch, cfg.BlockHTTP, "LIB "+GitCommit, netCfg, cfg.TunnelConfig, customTunNetCfg, multiChainCfg, connectCfg)
 		} else {
-			err = proxy.RunProxy(ActiveProxy, "127.0.0.1:"+fmt.Sprint(port), cfg.ADNLKey, ch, "LIB "+GitCommit, false, "", cfg.TunnelConfig, customTunNetCfg, multiChainCfg)
+			err = proxy.RunProxy(ActiveProxy, "127.0.0.1:"+fmt.Sprint(port), cfg.ADNLKey, ch, "LIB "+GitCommit, cfg.BlockHTTP, "", cfg.TunnelConfig, customTunNetCfg, multiChainCfg, connectCfg)
 		}
 		if err != nil {
 			log.Println("failed to start proxy:", err.Error())

@@ -8,6 +8,14 @@ import (
 	"sync"
 )
 
+type ConnectConfig struct {
+	Enabled      bool  `json:"Enabled"`
+	AllowedPorts []int `json:"AllowedPorts,omitempty"`
+	MaxTunnels   int   `json:"MaxTunnels,omitempty"`
+	DialTimeout  int   `json:"DialTimeoutSec,omitempty"`
+	IdleTimeout  int   `json:"IdleTimeoutSec,omitempty"`
+}
+
 type ResolverConfig struct {
 	RPCOverrides map[string]string `json:"RPCOverrides,omitempty"`
 	Disabled     []string          `json:"Disabled,omitempty"`
@@ -20,7 +28,10 @@ type Config struct {
 	CustomTunnelNetworkConfigPath string
 	TunnelConfig                  *tunnelConfig.ClientConfig
 
-	Resolver *ResolverConfig `json:"Resolver,omitempty"`
+	Resolver        *ResolverConfig `json:"Resolver,omitempty"`
+	BlockHTTP       bool            `json:"BlockHTTP,omitempty"`
+	Connect         *ConnectConfig  `json:"Connect,omitempty"`
+	ClearnetEnabled bool            `json:"ClearnetEnabled,omitempty"`
 
 	mx sync.Mutex
 }

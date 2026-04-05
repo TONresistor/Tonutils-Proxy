@@ -266,9 +266,9 @@ func (s *siteInfo) prepare(t *Transport, request *http.Request) (err error) {
 	default:
 	}
 
-	host := request.Host
+	host := request.URL.Host
 	if host == "" {
-		host = request.URL.Host
+		host = request.Host
 	}
 
 	if s.Actor == nil || atomic.LoadInt64(&s.LastSuccess)+90 < time.Now().Unix() {
@@ -304,9 +304,12 @@ func (s *siteInfo) prepare(t *Transport, request *http.Request) (err error) {
 }
 
 func (t *Transport) RoundTrip(request *http.Request) (_ *http.Response, err error) {
-	host := request.Host
+	// For multi-chain domains, the proxy sets URL.Host to the resolved .adnl
+	// address while keeping Host as the original domain (e.g. "tonnet.eth").
+	// Use URL.Host for routing/resolution when it differs from Host.
+	host := request.URL.Host
 	if host == "" {
-		host = request.URL.Host
+		host = request.Host
 	}
 
 	t.mx.Lock()
@@ -505,6 +508,14 @@ func (t *Transport) doRldpHttp(client RLDP, host string, request *http.Request) 
 		return nil, err
 	}
 
+	// Use the original Host header (e.g. "tonnet.eth") so the remote nginx
+	// can match its server_name. The host parameter is the .adnl routing
+	// address used for RLDP transport only.
+	rldpHost := request.Host
+	if rldpHost == "" {
+		rldpHost = host
+	}
+
 	req := Request{
 		ID:      qid,
 		Method:  request.Method,
@@ -513,7 +524,7 @@ func (t *Transport) doRldpHttp(client RLDP, host string, request *http.Request) 
 		Headers: []Header{
 			{
 				Name:  "Host",
-				Value: host,
+				Value: rldpHost,
 			},
 		},
 	}

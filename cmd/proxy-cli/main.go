@@ -28,6 +28,8 @@ func main() {
 	var noEth = flag.Bool("no-eth", false, "Disable .eth domain resolution")
 	var solRPC = flag.String("sol-rpc", "", "Custom Solana RPC endpoint for SNS resolution")
 	var noSol = flag.Bool("no-sol", false, "Disable .sol domain resolution")
+	var noConnect = flag.Bool("no-connect", false, "Disable CONNECT tunnel support")
+	var clearnet = flag.Bool("clearnet", false, "Route HTTPS CONNECT through tunnel exit nodes (requires --tunnel)")
 
 	flag.Parse()
 
@@ -38,6 +40,10 @@ func main() {
 
 	if *tunnelSections == 1 {
 		log.Fatal().Msg("--tunnel requires at least 2 sections (use --tunnel 2 or higher)")
+	}
+
+	if *clearnet && *tunnelSections < 2 {
+		log.Fatal().Msg("--clearnet requires --tunnel N (N >= 2)")
 	}
 
 	log.Info().Msg("Version:" + GitCommit)
@@ -116,8 +122,23 @@ func main() {
 		}
 	}
 
+	var connectCfg *proxy.ConnectConfig
+	if *noConnect {
+		// CLI explicitly disabled CONNECT
+		connectCfg = nil
+	} else if cfg.Connect != nil && cfg.Connect.Enabled {
+		// Config file enables CONNECT
+		connectCfg = &proxy.ConnectConfig{
+			Enabled:      true,
+			AllowedPorts: cfg.Connect.AllowedPorts,
+			MaxTunnels:   cfg.Connect.MaxTunnels,
+			DialTimeout:  time.Duration(cfg.Connect.DialTimeout) * time.Second,
+			IdleTimeout:  time.Duration(cfg.Connect.IdleTimeout) * time.Second,
+		}
+	}
+
 	go func() {
-		err = proxy.RunProxy(closerCtx, *addr, cfg.ADNLKey, nil, "CLI "+GitCommit, *blockHttp, *networkConfigPath, cfg.TunnelConfig, customTinNetCfg, multiChainCfg)
+		err = proxy.RunProxy(closerCtx, *addr, cfg.ADNLKey, nil, "CLI "+GitCommit, *blockHttp, *networkConfigPath, cfg.TunnelConfig, customTinNetCfg, multiChainCfg, connectCfg, *clearnet)
 		if err != nil {
 			log.Fatal().Err(err).Msg("proxy failed")
 		}

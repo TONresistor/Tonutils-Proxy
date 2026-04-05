@@ -4,6 +4,8 @@ go 1.24.0
 
 toolchain go1.24.3
 
+replace github.com/ton-blockchain/adnl-tunnel => github.com/TONresistor/adnl-tunnel v0.2.0-clearnet
+
 require (
 	github.com/ethereum/go-ethereum v1.17.2
 	github.com/gagliardetto/solana-go v1.16.0
