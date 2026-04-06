@@ -5,4 +5,4 @@ proxy/window
 *.json
 !*.json.example
 payments-db
-/proxy-cli
+/proxy-clilib

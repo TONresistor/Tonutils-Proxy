@@ -124,10 +124,17 @@ func main() {
 
 	var connectCfg *proxy.ConnectConfig
 	if *noConnect {
-		// CLI explicitly disabled CONNECT
 		connectCfg = nil
+	} else if *clearnet {
+		// --clearnet flag: enable CONNECT with safe defaults
+		connectCfg = &proxy.ConnectConfig{
+			Enabled:      true,
+			AllowedPorts: []int{443},
+			MaxTunnels:   128,
+			DialTimeout:  10 * time.Second,
+			IdleTimeout:  120 * time.Second,
+		}
 	} else if cfg.Connect != nil && cfg.Connect.Enabled {
-		// Config file enables CONNECT
 		connectCfg = &proxy.ConnectConfig{
 			Enabled:      true,
 			AllowedPorts: cfg.Connect.AllowedPorts,
@@ -138,7 +145,7 @@ func main() {
 	}
 
 	go func() {
-		err = proxy.RunProxy(closerCtx, *addr, cfg.ADNLKey, nil, "CLI "+GitCommit, *blockHttp, *networkConfigPath, cfg.TunnelConfig, customTinNetCfg, multiChainCfg, connectCfg, *clearnet)
+		err = proxy.RunProxy(closerCtx, *addr, cfg.ADNLKey, nil, "CLI "+GitCommit, *blockHttp, *networkConfigPath, cfg.TunnelConfig, customTinNetCfg, multiChainCfg, connectCfg)
 		if err != nil {
 			log.Fatal().Err(err).Msg("proxy failed")
 		}

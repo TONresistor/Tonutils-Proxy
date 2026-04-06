@@ -28,10 +28,9 @@ type Config struct {
 	CustomTunnelNetworkConfigPath string
 	TunnelConfig                  *tunnelConfig.ClientConfig
 
-	Resolver        *ResolverConfig `json:"Resolver,omitempty"`
-	BlockHTTP       bool            `json:"BlockHTTP,omitempty"`
-	Connect         *ConnectConfig  `json:"Connect,omitempty"`
-	ClearnetEnabled bool            `json:"ClearnetEnabled,omitempty"`
+	Resolver *ResolverConfig `json:"Resolver,omitempty"`
+	BlockHTTP bool           `json:"BlockHTTP,omitempty"`
+	Connect  *ConnectConfig  `json:"Connect,omitempty"`
 
 	mx sync.Mutex
 }

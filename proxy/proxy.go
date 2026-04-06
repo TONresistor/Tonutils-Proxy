@@ -79,7 +79,6 @@ type proxy struct {
 	multiResolver *resolver.MultiResolver
 
 	connectEnabled     bool
-	clearnetEnabled    bool
 	connectPorts       map[int]bool
 	connectBlacklist   []*net.IPNet
 	connectTimeout     time.Duration
@@ -198,7 +197,7 @@ type MultiChainConfig struct {
 	Disabled map[string]bool
 }
 
-func RunProxy(closerCtx context.Context, addr string, adnlKey ed25519.PrivateKey, res chan<- State, versionAndDevice string, blockHttp bool, netConfigPath string, tunCfg *tunnelConfig.ClientConfig, customTunNetCfg *liteclient.GlobalConfig, multiChainCfg *MultiChainConfig, connectCfg *ConnectConfig, clearnetEnabled ...bool) error {
+func RunProxy(closerCtx context.Context, addr string, adnlKey ed25519.PrivateKey, res chan<- State, versionAndDevice string, blockHttp bool, netConfigPath string, tunCfg *tunnelConfig.ClientConfig, customTunNetCfg *liteclient.GlobalConfig, multiChainCfg *MultiChainConfig, connectCfg *ConnectConfig) error {
 	if res != nil {
 		res <- State{
 			Type:  "loading",
@@ -226,8 +225,7 @@ func RunProxy(closerCtx context.Context, addr string, adnlKey ed25519.PrivateKey
 		}
 	}
 
-	cn := len(clearnetEnabled) > 0 && clearnetEnabled[0]
-	return RunProxyWithConfig(closerCtx, addr, adnlKey, res, blockHttp, versionAndDevice, lsCfg, tunCfg, customTunNetCfg, multiChainCfg, connectCfg, cn)
+	return RunProxyWithConfig(closerCtx, addr, adnlKey, res, blockHttp, versionAndDevice, lsCfg, tunCfg, customTunNetCfg, multiChainCfg, connectCfg)
 }
 
 var OnTunnel = func(addr string) {}
@@ -240,7 +238,7 @@ var OnAskReroute = func() bool { return false }
 
 var OnTunnelStopped = func() {}
 
-func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.PrivateKey, res chan<- State, blockHttp bool, versionAndDevice string, lsCfg *liteclient.GlobalConfig, tunCfg *tunnelConfig.ClientConfig, customTunNetCfg *liteclient.GlobalConfig, multiChainCfg *MultiChainConfig, connectCfg *ConnectConfig, clearnetEnabled ...bool) error {
+func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.PrivateKey, res chan<- State, blockHttp bool, versionAndDevice string, lsCfg *liteclient.GlobalConfig, tunCfg *tunnelConfig.ClientConfig, customTunNetCfg *liteclient.GlobalConfig, multiChainCfg *MultiChainConfig, connectCfg *ConnectConfig) error {
 	report := func(s State) {
 		if res != nil {
 			res <- s
@@ -288,10 +286,11 @@ func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.
 	}
 	defer multiRes.Close()
 
-	isClearnet := len(clearnetEnabled) > 0 && clearnetEnabled[0]
+	// Clearnet mode: derived from config (CONNECT enabled + multi-hop tunnel)
+	isClearnet := connectCfg != nil && connectCfg.Enabled && tunCfg != nil && tunCfg.TunnelSectionsNum >= 2
 
-	// Enable clearnet exit mode before tunnel starts
 	if isClearnet {
+		log.Info().Msg("Clearnet mode active")
 		tunnel.ClearnetExitMode = true
 		tunnel.OnTCPPayload = dispatchTCPPayload
 	}
@@ -328,22 +327,12 @@ func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.
 
 				// Also discover regular relay nodes for intermediate hops
 				log.Info().Msg("Discovering tunnel relay nodes from DHT...")
-				allRelayNodes := discoverTunnelNodes(lsCfg)
+				relayNodes := discoverTunnelNodes(lsCfg)
+				log.Info().Int("count", len(relayNodes)).Msg("Tunnel relay nodes discovered from DHT")
 
-				// Filter out exit nodes from relay list to avoid self-routing loops
-				exitKeySet := make(map[string]bool)
-				for _, en := range exitNodes {
-					exitKeySet[string(en.Key)] = true
-				}
-				var relayNodes []tunnelConfig.TunnelRouteSection
-				for _, rn := range allRelayNodes {
-					if !exitKeySet[string(rn.Key)] {
-						relayNodes = append(relayNodes, rn)
-					}
-				}
-				log.Info().Int("count", len(relayNodes)).Msg("Tunnel relay nodes discovered from DHT (excluding exit nodes)")
-
-				// Build pool: relay nodes first, exit nodes last (so tunnel builder places exit at end)
+				// Build pool: relay nodes first, exit nodes last.
+				// Nodes can appear in both lists (dual relay+exit). The exit node
+				// is pinned as last hop by configureRoute, so duplicates are safe.
 				tunNodesCfg.NodesPool = append(relayNodes, exitNodes...)
 			} else {
 				log.Info().Msg("Discovering tunnel relay nodes from DHT...")
@@ -549,20 +538,9 @@ func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.
 	log.Info().Str("address", addr).Msg("Starting proxy server")
 
 	p := &proxy{
-		blockHttp:       true, // always block cleartext HTTP — HTTPS only
-		version:         versionAndDevice,
-		multiResolver:   multiRes,
-		clearnetEnabled: isClearnet,
-	}
-	// When clearnet is active, force CONNECT support
-	if isClearnet && connectCfg == nil {
-		connectCfg = &ConnectConfig{
-			Enabled:      true,
-			AllowedPorts: []int{443},
-			MaxTunnels:   128,
-			DialTimeout:  10 * time.Second,
-			IdleTimeout:  120 * time.Second,
-		}
+		blockHttp:     true, // always block cleartext HTTP — HTTPS only
+		version:       versionAndDevice,
+		multiResolver: multiRes,
 	}
 	if connectCfg != nil && connectCfg.Enabled {
 		p.connectEnabled = true

@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -119,6 +120,14 @@ func (p *proxy) handleCONNECT(wr http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// TON domains use RLDP, not CONNECT. Reject so the browser falls back to HTTP.
+	lowerHost := strings.ToLower(host)
+	if strings.HasSuffix(lowerHost, ".ton") || strings.HasSuffix(lowerHost, ".adnl") ||
+		strings.HasSuffix(lowerHost, ".bag") || strings.HasSuffix(lowerHost, ".t.me") || lowerHost == "t.me" {
+		http.Error(wr, "CONNECT not supported for TON domains", http.StatusMethodNotAllowed)
+		return
+	}
+
 	port, err := strconv.Atoi(portStr)
 	if err != nil {
 		http.Error(wr, "invalid port", http.StatusBadRequest)
@@ -131,8 +140,8 @@ func (p *proxy) handleCONNECT(wr http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// If clearnet mode is active, route through tunnel exit node
-	if p.clearnetEnabled {
+	// If a tunnel exit is active, route CONNECT through it
+	if activeTunnel.Load() != nil {
 		p.handleClearnetCONNECT(wr, req, host, port)
 		return
 	}
