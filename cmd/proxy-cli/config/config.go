@@ -109,7 +109,7 @@ func (cfg *Config) SaveConfig(dir string) error {
 		return err
 	}
 
-	err = os.WriteFile(path, data, 0766)
+	err = os.WriteFile(path, data, 0600)
 	if err != nil {
 		return err
 	}

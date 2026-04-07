@@ -169,7 +169,8 @@ func (p *proxy) handleCONNECT(wr http.ResponseWriter, req *http.Request) {
 	}
 	defer func() { <-p.connectSem }()
 
-	serverConn, err := net.DialTimeout("tcp", req.Host, p.connectTimeout)
+	// Dial the resolved IP directly — never re-resolve the hostname (DNS rebinding defense)
+	serverConn, err := net.DialTimeout("tcp", addr.String(), p.connectTimeout)
 	if err != nil {
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 			http.Error(wr, "dial timeout", http.StatusGatewayTimeout)
@@ -263,7 +264,7 @@ func (p *proxy) handleClearnetCONNECT(wr http.ResponseWriter, req *http.Request,
 		Port:   uint32(port),
 	}
 	if err := tun.WriteTCPPayload(connectPayload); err != nil {
-		log.Error().Err(err).Str("host", req.Host).Msg("clearnet CONNECT send failed")
+		log.Error().Err(err).Msg("clearnet CONNECT send failed")
 		http.Error(wr, "tunnel send failed", http.StatusBadGateway)
 		return
 	}
