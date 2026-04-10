@@ -27,8 +27,8 @@ github.com/ProjectZKM/Ziren/crates/go-runtime/zkvm_runtime v0.0.0-20251001021608
 github.com/ProjectZKM/Ziren/crates/go-runtime/zkvm_runtime v0.0.0-20251001021608-1fe7b43fc4d6/go.mod h1:ioLG6R+5bUSO1oeGSDxOV3FADARuMoytZCSX6MEMQkI=
 github.com/StackExchange/wmi v1.2.1 h1:VIkavFPXSjcnS+O8yTq7NI32k0R5Aj+v39y29VYDOSA=
 github.com/StackExchange/wmi v1.2.1/go.mod h1:rcmrprowKIVzvc+NUiLncP2uuArMWLCbu9SBzvHz7e8=
-github.com/TONresistor/adnl-tunnel v0.2.0-clearnet h1:wlO9N5aELiprY5pJbAtmitxd0SVY9lb5sFFNLwMmTSk=
-github.com/TONresistor/adnl-tunnel v0.2.0-clearnet/go.mod h1:MEjflDXTBgEB5b1YrcCaRFmXmraCy5xxytw79rwkj/4=
+github.com/TONresistor/adnl-tunnel v0.2.0-clearnet.0.20260410002843-1665e9450e9c h1:XlJzVjuLcWkwxOq0ls+D+FYWE+u/oInx8ZQzvyFZJ6U=
+github.com/TONresistor/adnl-tunnel v0.2.0-clearnet.0.20260410002843-1665e9450e9c/go.mod h1:MEjflDXTBgEB5b1YrcCaRFmXmraCy5xxytw79rwkj/4=
 github.com/VictoriaMetrics/fastcache v1.13.0 h1:AW4mheMR5Vd9FkAPUv+NH6Nhw+fmbTMGMsNAoA/+4G0=
 github.com/VictoriaMetrics/fastcache v1.13.0/go.mod h1:hHXhl4DA2fTL2HTZDJFXWgW0LNjo6B+4aj2Wmng3TjU=
 github.com/atomicgo/cursor v0.0.1/go.mod h1:cBON2QmmrysudxNBFthvMtN32r3jxVRIvzkUiF/RuIk=

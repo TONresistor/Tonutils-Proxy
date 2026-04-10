@@ -4,7 +4,7 @@ go 1.24.0
 
 toolchain go1.24.3
 
-replace github.com/ton-blockchain/adnl-tunnel => github.com/TONresistor/adnl-tunnel v0.2.0-clearnet
+replace github.com/ton-blockchain/adnl-tunnel => github.com/TONresistor/adnl-tunnel v0.2.0-clearnet.0.20260410002843-1665e9450e9c
 
 require (
 	github.com/ethereum/go-ethereum v1.17.2
