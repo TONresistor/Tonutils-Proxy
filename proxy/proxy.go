@@ -36,9 +36,10 @@ import (
 	"time"
 )
 
-// Hop-by-hop headers. These are removed when sent to the backend.
-// http://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html
+// Hop-by-hop headers (RFC 2616 §13) plus privacy-sensitive headers.
+// Privacy headers follow Privoxy/Tor Browser stripping conventions.
 var hopHeaders = []string{
+	// RFC 2616 hop-by-hop
 	"Connection",
 	"Keep-Alive",
 	"Proxy-Authenticate",
@@ -47,6 +48,16 @@ var hopHeaders = []string{
 	"Trailers",
 	"Transfer-Encoding",
 	"Upgrade",
+	// Privacy: tracking vectors
+	"Origin",
+	"Referer",
+	// Privacy: proxy topology leaks
+	"X-Forwarded-For",
+	"X-Forwarded-Host",
+	"X-Forwarded-Proto",
+	"X-Real-Ip",
+	"Forwarded",
+	"Via",
 }
 
 func copyHeader(dst, src http.Header) {
@@ -63,15 +74,6 @@ func delHopHeaders(header http.Header) {
 	}
 }
 
-func appendHostToXForwardHeader(header http.Header, host string) {
-	// If we aren't the first proxy retain prior
-	// X-Forwarded-For information as a comma+space
-	// separated list and fold multiple headers into one.
-	if prior, ok := header["X-Forwarded-For"]; ok {
-		host = strings.Join(prior, ", ") + ", " + host
-	}
-	header.Set("X-Forwarded-For", host)
-}
 
 type proxy struct {
 	version       string
@@ -109,9 +111,6 @@ func (p *proxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 
 	delHopHeaders(req.Header)
 
-	if clientIP, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
-		appendHostToXForwardHeader(req.Header, clientIP)
-	}
 	req.Header.Set("X-Tonutils-Proxy", p.version)
 
 	// Resolve multi-chain domains (e.g. .eth) to .adnl before routing
@@ -157,7 +156,7 @@ func (p *proxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 		} else {
 			http.Error(wr, "RLDP Proxy Error:\n"+text, http.StatusBadGateway)
 		}
-		log.Warn().Str("err", text).Str("method", req.Method).Str("url", req.URL.String()).Msg("cannot open")
+		log.Warn().Str("err", text).Str("method", req.Method).Msg("RLDP request failed")
 		return
 	}
 	defer resp.Body.Close()

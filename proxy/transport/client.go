@@ -27,6 +27,29 @@ import (
 const _ChunkSize = 1 << 17
 const _RLDPMaxAnswerSize = 2*_ChunkSize + 1024
 
+// blockedResponseHeaders prevents malicious TON sites from injecting
+// dangerous headers into the HTTP response sent to the user's browser.
+var blockedResponseHeaders = map[string]bool{
+	"X-Forwarded-For":             true, // proxy topology
+	"X-Forwarded-Host":            true,
+	"X-Forwarded-Proto":           true,
+	"X-Real-Ip":                   true,
+	"Forwarded":                   true,
+	"Via":                         true,
+	"Connection":                  true, // hop-by-hop
+	"Keep-Alive":                  true,
+	"Proxy-Authenticate":          true,
+	"Proxy-Authorization":         true,
+	"Transfer-Encoding":           true,
+	"Upgrade":                     true,
+	"Public-Key-Pins":             true, // security policy injection
+	"Public-Key-Pins-Report-Only": true,
+}
+
+func isBlockedResponseHeader(name string) bool {
+	return blockedResponseHeaders[http.CanonicalHeaderKey(name)]
+}
+
 type DHT interface {
 	StoreAddress(ctx context.Context, addresses address.List, ttl time.Duration, ownerKey ed25519.PrivateKey, copies int) (int, []byte, error)
 	FindAddresses(ctx context.Context, key []byte) (*address.List, ed25519.PublicKey, error)
@@ -199,13 +222,15 @@ func (t *Transport) getRLDPQueryHandler(r RLDP) func(transferId []byte, query *r
 	return func(transferId []byte, query *rldp.Query) error {
 		switch req := query.Data.(type) {
 		case GetNextPayloadPart:
-			t.mx.RLock()
-			stream := t.activeRequests[hex.EncodeToString(req.ID)]
-			t.mx.RUnlock()
+			reqID := hex.EncodeToString(req.ID)
 
+			t.mx.Lock()
+			stream := t.activeRequests[reqID]
 			if stream == nil {
-				return fmt.Errorf("unknown request id %s", hex.EncodeToString(req.ID))
+				t.mx.Unlock()
+				return fmt.Errorf("unknown request id %s", reqID)
 			}
+			t.mx.Unlock()
 
 			part, err := handleGetPart(req, stream)
 			if err != nil {
@@ -221,7 +246,7 @@ func (t *Transport) getRLDPQueryHandler(r RLDP) func(transferId []byte, query *r
 
 			if part.IsLast {
 				t.mx.Lock()
-				delete(t.activeRequests, hex.EncodeToString(req.ID))
+				delete(t.activeRequests, reqID)
 				t.mx.Unlock()
 				_ = stream.Data.Close()
 			}
@@ -232,12 +257,18 @@ func (t *Transport) getRLDPQueryHandler(r RLDP) func(transferId []byte, query *r
 	}
 }
 
+const _MaxAllowedChunkSize = 16 << 20 // 16MB hard cap for incoming RLDP requests
+
 func handleGetPart(req GetNextPayloadPart, stream *payloadStream) (*PayloadPart, error) {
 	stream.mx.Lock()
 	defer stream.mx.Unlock()
 
-	offset := int(req.Seqno * req.MaxChunkSize)
-	if offset != stream.nextOffset {
+	if req.MaxChunkSize <= 0 || req.MaxChunkSize > _MaxAllowedChunkSize {
+		return nil, fmt.Errorf("invalid MaxChunkSize %d for stream %s", req.MaxChunkSize, hex.EncodeToString(req.ID))
+	}
+
+	offset := int64(req.Seqno) * int64(req.MaxChunkSize)
+	if offset != int64(stream.nextOffset) {
 		return nil, fmt.Errorf("failed to get part for stream %s, incorrect offset %d, should be %d", hex.EncodeToString(req.ID), offset, stream.nextOffset)
 	}
 
@@ -598,6 +629,9 @@ func (t *Transport) doRldpHttp(client RLDP, host string, request *http.Request) 
 	}
 
 	for _, header := range res.Headers {
+		if isBlockedResponseHeader(header.Name) {
+			continue
+		}
 		httpResp.Header.Add(header.Name, header.Value)
 	}
 
@@ -675,9 +709,10 @@ func (t *Transport) resolve(ctx context.Context, host string) (_ any, err error)
 		tm := time.Now()
 		lookupCtx, stopLookup := context.WithCancel(ctx)
 		ch := make(chan *dns.Domain, 3)
+		const _MaxResolveRetries = 5
 		for i := 0; i < 3; i++ { // do parallel lookup on diff nodes to speedup
 			go func(i int) {
-				for {
+				for attempt := 0; attempt < _MaxResolveRetries; attempt++ {
 					// each new thread has bigger timeout, to cover users with high ping
 					resolveCtx, cancel := context.WithTimeout(lookupCtx, time.Duration((i+1)*2)*time.Second)
 					domain, err := t.resolver.Resolve(resolveCtx, host)
@@ -691,7 +726,7 @@ func (t *Transport) resolve(ctx context.Context, host string) (_ any, err error)
 							ch <- nil
 							return
 						}
-						log.Error().Err(err).Str("domain", host).Msg("resolve error")
+						log.Error().Err(err).Msg("domain resolve error")
 						continue
 					}
 
@@ -766,7 +801,8 @@ func (t *Transport) resolve(ctx context.Context, host string) (_ any, err error)
 		// find working rldp node addr
 		client, err = t.connectRLDP(pubKey, addr, host)
 		if err != nil {
-			log.Error().Err(err).Str("host", host).Str("node", hex.EncodeToString(id)).Str("address", addr).Msg("connection failed")
+			log.Error().Err(err).Msg("RLDP connection failed")
+			log.Debug().Str("host", host).Str("node", hex.EncodeToString(id)).Str("address", addr).Msg("RLDP connection failed details")
 
 			triedAddresses = append(triedAddresses, addr)
 			continue
