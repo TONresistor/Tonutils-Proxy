@@ -495,7 +495,13 @@ func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.
 
 	log.Info().Str("address", addr).Msg("Starting proxy server")
 
-	server := http.Server{Addr: addr, Handler: &proxy{blockHttp: blockHttp, version: versionAndDevice, multiResolver: multiRes}}
+	server := http.Server{
+		Addr:              addr,
+		Handler:           &proxy{blockHttp: blockHttp, version: versionAndDevice, multiResolver: multiRes},
+		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      120 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 
 	go func() {
 		<-ctx.Done()

@@ -27,6 +27,10 @@ import (
 const _ChunkSize = 1 << 17
 const _RLDPMaxAnswerSize = 2*_ChunkSize + 1024
 
+const _DHTFindTimeout = 10 * time.Second
+const _RLDPConnectTimeout = 8 * time.Second
+const _RoundTripMaxRetries = 2
+
 // blockedResponseHeaders prevents malicious TON sites from injecting
 // dangerous headers into the HTTP response sent to the user's browser.
 var blockedResponseHeaders = map[string]bool{
@@ -179,16 +183,29 @@ func (t *Transport) cleaner() {
 }
 
 func (t *Transport) connectRLDP(key ed25519.PublicKey, addr, host string) (RLDP, error) {
-	a, err := t.gate.RegisterClient(addr, key)
-	if err != nil {
-		return nil, fmt.Errorf("failed to init adnl for rldp connection %s, err: %w", addr, err)
+	type result struct {
+		r   RLDP
+		err error
 	}
+	ch := make(chan result, 1)
+	go func() {
+		a, err := t.gate.RegisterClient(addr, key)
+		if err != nil {
+			ch <- result{nil, fmt.Errorf("failed to init adnl for rldp connection %s, err: %w", addr, err)}
+			return
+		}
+		r := newRLDP(a)
+		r.SetOnQuery(t.getRLDPQueryHandler(r))
+		r.SetOnDisconnect(t.removeRLDP(r, host))
+		ch <- result{r, nil}
+	}()
 
-	r := newRLDP(a)
-	r.SetOnQuery(t.getRLDPQueryHandler(r))
-	r.SetOnDisconnect(t.removeRLDP(r, host))
-
-	return r, nil
+	select {
+	case res := <-ch:
+		return res.r, res.err
+	case <-time.After(_RLDPConnectTimeout):
+		return nil, fmt.Errorf("ADNL handshake timeout after %s for %s", _RLDPConnectTimeout, addr)
+	}
 }
 
 func (t *Transport) removeRLDP(rl RLDP, host string) func() {
@@ -290,7 +307,15 @@ func handleGetPart(req GetNextPayloadPart, stream *payloadStream) (*PayloadPart,
 	}, nil
 }
 
-func (s *siteInfo) prepare(t *Transport, request *http.Request) (err error) {
+func (s *siteInfo) prepare(t *Transport, request *http.Request) error {
+	return s.prepareWithDepth(t, request, 0)
+}
+
+func (s *siteInfo) prepareWithDepth(t *Transport, request *http.Request, depth int) (err error) {
+	if depth > 1 {
+		return fmt.Errorf("prepare recursion limit reached for %s", request.Host)
+	}
+
 	select {
 	case <-t.globalCtx.Done():
 		return t.globalCtx.Err()
@@ -326,7 +351,7 @@ func (s *siteInfo) prepare(t *Transport, request *http.Request) (err error) {
 			if err != nil {
 				// resolve again
 				s.Actor = nil
-				return s.prepare(t, request)
+				return s.prepareWithDepth(t, request, depth+1)
 			}
 			atomic.StoreInt64(&s.LastUsed, time.Now().Unix())
 		}
@@ -350,49 +375,61 @@ func (t *Transport) RoundTrip(request *http.Request) (_ *http.Response, err erro
 	}
 	t.mx.Unlock()
 
-	var rldpClient RLDP
-	var torrent *bagInfo
-
-	tm := time.Now()
-	site.mx.Lock()
-	err = site.prepare(t, request)
-	log.Info().Str("host", host).Dur("took", time.Since(tm)).Msg("prepare took")
-
-	if err != nil {
-		site.mx.Unlock()
-		return nil, fmt.Errorf("failed to connect to site: %w", err)
-	}
-
-	switch act := site.Actor.(type) {
-	case *rldpInfo:
-		rldpClient = act.ActiveClient
-	case *bagInfo:
-		torrent = act
-	}
-	site.mx.Unlock()
-
-	if rldpClient != nil {
-		resp, err := t.doRldpHttp(rldpClient, host, request)
-		if err != nil {
-			// Invalidate the cached RLDP connection so the next request
-			// reconnects instead of reusing a dead connection.
+	for attempt := 0; attempt <= _RoundTripMaxRetries; attempt++ {
+		if attempt > 0 {
+			log.Info().Int("attempt", attempt+1).Str("host", host).Msg("retrying connection")
+			// Force re-resolve on retry.
 			site.mx.Lock()
-			if act, ok := site.Actor.(*rldpInfo); ok {
-				act.destroyClient(rldpClient)
-			}
+			site.Actor = nil
 			site.mx.Unlock()
-			return nil, fmt.Errorf("failed to request rldp-http site: %w", err)
+		}
+
+		var rldpClient RLDP
+		var torrent *bagInfo
+
+		tm := time.Now()
+		site.mx.Lock()
+		err = site.prepare(t, request)
+		log.Info().Str("host", host).Dur("took", time.Since(tm)).Msg("prepare took")
+
+		if err != nil {
+			site.mx.Unlock()
+			continue
+		}
+
+		switch act := site.Actor.(type) {
+		case *rldpInfo:
+			rldpClient = act.ActiveClient
+		case *bagInfo:
+			torrent = act
+		}
+		site.mx.Unlock()
+
+		if rldpClient != nil {
+			resp, err := t.doRldpHttp(rldpClient, host, request)
+			if err != nil {
+				// Invalidate the cached RLDP connection so the next request
+				// reconnects instead of reusing a dead connection.
+				site.mx.Lock()
+				if act, ok := site.Actor.(*rldpInfo); ok {
+					act.destroyClient(rldpClient)
+				}
+				site.mx.Unlock()
+				continue
+			}
+			atomic.StoreInt64(&site.LastSuccess, time.Now().Unix())
+			return resp, nil
+		}
+
+		resp, err := t.doTorrent(torrent, request, site)
+		if err != nil {
+			continue
 		}
 		atomic.StoreInt64(&site.LastSuccess, time.Now().Unix())
 		return resp, nil
 	}
 
-	resp, err := t.doTorrent(torrent, request, site)
-	if err != nil {
-		return nil, fmt.Errorf("failed to request file from storage: %w", err)
-	}
-	atomic.StoreInt64(&site.LastSuccess, time.Now().Unix())
-	return resp, nil
+	return nil, fmt.Errorf("failed to connect to site after %d attempts: %w", _RoundTripMaxRetries+1, err)
 }
 
 func (t *Transport) doTorrent(bag *bagInfo, request *http.Request, si *siteInfo) (*http.Response, error) {
@@ -779,7 +816,10 @@ func (t *Transport) resolve(ctx context.Context, host string) (_ any, err error)
 
 	log.Info().Str("host", host).Str("node", hex.EncodeToString(id)).Msg("resolving ton site address")
 
-	addresses, pubKey, err := t.dht.FindAddresses(ctx, id)
+	dhtCtx, dhtCancel := context.WithTimeout(ctx, _DHTFindTimeout)
+	defer dhtCancel()
+
+	addresses, pubKey, err := t.dht.FindAddresses(dhtCtx, id)
 	if err != nil {
 		return nil, fmt.Errorf("failed to find address of %s (%s) in DHT, err: %w", host, hex.EncodeToString(id), err)
 	}
@@ -790,27 +830,42 @@ func (t *Transport) resolve(ctx context.Context, host string) (_ any, err error)
 
 	log.Info().Str("host", host).Str("node", hex.EncodeToString(id)).Msg("server address resolved")
 
-	var addr string
-	var client RLDP
-	var triedAddresses []string
-	for _, v := range addresses.Addresses {
-		addr = fmt.Sprintf("%s:%d", v.IP.String(), v.Port)
+	// Connect to addresses in parallel, first success wins.
+	type connResult struct {
+		client RLDP
+		addr   string
+		err    error
+	}
+	addrList := addresses.Addresses
+	connCh := make(chan connResult, len(addrList))
 
+	for _, v := range addrList {
+		addr := fmt.Sprintf("%s:%d", v.IP.String(), v.Port)
 		log.Info().Str("host", host).Str("node", hex.EncodeToString(id)).Str("address", addr).Msg("connecting to ton site")
+		go func(addr string) {
+			c, err := t.connectRLDP(pubKey, addr, host)
+			connCh <- connResult{c, addr, err}
+		}(addr)
+	}
 
-		// find working rldp node addr
-		client, err = t.connectRLDP(pubKey, addr, host)
-		if err != nil {
-			log.Error().Err(err).Msg("RLDP connection failed")
-			log.Debug().Str("host", host).Str("node", hex.EncodeToString(id)).Str("address", addr).Msg("RLDP connection failed details")
-
-			triedAddresses = append(triedAddresses, addr)
+	var client RLDP
+	var addr string
+	var triedAddresses []string
+	remaining := len(addrList)
+	for remaining > 0 {
+		res := <-connCh
+		remaining--
+		if res.err != nil {
+			log.Error().Err(res.err).Msg("RLDP connection failed")
+			log.Debug().Str("host", host).Str("node", hex.EncodeToString(id)).Str("address", res.addr).Msg("RLDP connection failed details")
+			triedAddresses = append(triedAddresses, res.addr)
 			continue
 		}
-
+		client = res.client
+		addr = res.addr
 		break
 	}
-	if err != nil {
+	if client == nil {
 		return nil, fmt.Errorf("failed to connect to rldp servers %s of host %s, err: %w", triedAddresses, host, err)
 	}
 
