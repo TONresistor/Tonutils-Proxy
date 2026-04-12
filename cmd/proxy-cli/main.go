@@ -61,15 +61,12 @@ func main() {
 	if cfg.TunnelConfig == nil {
 		cfg.TunnelConfig = &tunnelConfig.ClientConfig{}
 	}
-	// --tunnel flag overrides config: use DHT discovery (free relays), no payments.
-	// Without it, respect config.json (used by Tonnet-Browser GUI).
 	if *tunnelSections > 0 {
 		cfg.TunnelConfig.TunnelSectionsNum = uint(*tunnelSections)
-		cfg.TunnelConfig.NodesPoolConfigPath = ""
 		cfg.TunnelConfig.PaymentsEnabled = false
 	}
 
-	tunnelEnabled := cfg.TunnelConfig.TunnelSectionsNum >= 2 || cfg.TunnelConfig.NodesPoolConfigPath != ""
+	tunnelEnabled := cfg.TunnelConfig.TunnelSectionsNum >= 2
 	closerCtx, stop := context.WithCancel(context.Background())
 
 	var tunnelCtx context.Context

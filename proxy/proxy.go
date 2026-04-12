@@ -36,6 +36,12 @@ import (
 	"time"
 )
 
+const (
+	tunnelNodesCacheTTL       = 1 * time.Hour
+	dhtDiscoverInitialBackoff = 500 * time.Millisecond
+	dhtDiscoverAttemptTimeout = 8 * time.Second
+)
+
 // Hop-by-hop headers (RFC 2616 §13) plus privacy-sensitive headers.
 // Privacy headers follow Privoxy/Tor Browser stripping conventions.
 var hopHeaders = []string{
@@ -277,7 +283,7 @@ func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.
 
 	var gate *adnl.Gateway
 	var netMgr adnl.NetManager
-	if tunCfg != nil && (tunCfg.NodesPoolConfigPath != "" || tunCfg.TunnelSectionsNum >= 2) {
+	if tunCfg != nil && tunCfg.TunnelSectionsNum >= 2 {
 		report(State{
 			Type:  "loading",
 			State: "Preparing ADNL tunnel...",
@@ -285,13 +291,20 @@ func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.
 
 		var tunNodesCfg tunnelConfig.SharedConfig
 
-		// Load nodes from file if configured (backwards-compatible)
 		if tunCfg.NodesPoolConfigPath != "" {
-			data, err := os.ReadFile(tunCfg.NodesPoolConfigPath)
-			if err != nil {
-				log.Warn().Err(err).Msg("Failed to load tunnel nodes pool file, falling back to DHT discovery")
-			} else if err = json.Unmarshal(data, &tunNodesCfg); err != nil {
-				log.Warn().Err(err).Msg("Failed to parse tunnel nodes pool file, falling back to DHT discovery")
+			info, statErr := os.Stat(tunCfg.NodesPoolConfigPath)
+			switch {
+			case statErr != nil && !os.IsNotExist(statErr):
+				log.Warn().Err(statErr).Msg("Failed to stat tunnel nodes cache, falling back to DHT discovery")
+			case statErr == nil && time.Since(info.ModTime()) > tunnelNodesCacheTTL:
+				log.Info().Msg("Tunnel nodes cache too old, refreshing via DHT")
+			case statErr == nil:
+				data, err := os.ReadFile(tunCfg.NodesPoolConfigPath)
+				if err != nil {
+					log.Warn().Err(err).Msg("Failed to load tunnel nodes pool file, falling back to DHT discovery")
+				} else if err = json.Unmarshal(data, &tunNodesCfg); err != nil {
+					log.Warn().Err(err).Msg("Failed to parse tunnel nodes pool file, falling back to DHT discovery")
+				}
 			}
 		}
 
@@ -304,6 +317,13 @@ func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.
 			}
 			tunNodesCfg.NodesPool = discovered
 			log.Info().Int("count", len(discovered)).Msg("Tunnel relay nodes discovered from DHT")
+			if tunCfg.NodesPoolConfigPath != "" {
+				if err := tunnelConfig.SaveConfig(&tunNodesCfg, tunCfg.NodesPoolConfigPath); err != nil {
+					log.Warn().Err(err).Msg("Failed to persist tunnel nodes cache")
+				} else {
+					log.Info().Str("path", tunCfg.NodesPoolConfigPath).Msg("Persisted tunnel nodes for warm restart")
+				}
+			}
 		}
 
 		if customTunNetCfg == nil {
@@ -616,8 +636,8 @@ func discoverTunnelNodes(netCfg *liteclient.GlobalConfig) []tunnelConfig.TunnelR
 	var allNodes []overlay.Node
 	var lastErr error
 
-	// Retry with exponential backoff (2s, 4s, 8s). Each attempt has a 30s timeout.
-	backoff := 2 * time.Second
+	// Retry with exponential backoff (500ms, 1s, 2s). Each attempt has an 8s timeout.
+	backoff := dhtDiscoverInitialBackoff
 	for attempt := 0; attempt < 4; attempt++ {
 		if attempt > 0 {
 			select {
@@ -628,7 +648,7 @@ func discoverTunnelNodes(netCfg *liteclient.GlobalConfig) []tunnelConfig.TunnelR
 			}
 		}
 
-		attemptCtx, attemptCancel := context.WithTimeout(ctx, 30*time.Second)
+		attemptCtx, attemptCancel := context.WithTimeout(ctx, dhtDiscoverAttemptTimeout)
 		var cont *dht.Continuation
 		for i := 0; i < 3; i++ {
 			nodesList, c, err := dhtClient.FindOverlayNodes(attemptCtx, overlayKey, cont)

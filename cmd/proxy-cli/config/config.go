@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	tunnelConfig "github.com/ton-blockchain/adnl-tunnel/config"
 	"os"
+	"path/filepath"
 	"sync"
 )
 
@@ -83,6 +84,10 @@ func LoadConfig(dir string) (*Config, error) {
 		if err != nil {
 			return nil, err
 		}
+	}
+
+	if cfg.TunnelConfig != nil && cfg.TunnelConfig.TunnelSectionsNum >= 2 && cfg.TunnelConfig.NodesPoolConfigPath == "" {
+		cfg.TunnelConfig.NodesPoolConfigPath = filepath.Join(filepath.Dir(path), "tunnel-nodes-cache.json")
 	}
 
 	return cfg, nil

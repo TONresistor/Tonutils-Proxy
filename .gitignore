@@ -6,3 +6,5 @@ proxy/window
 !*.json.example
 payments-db
 /proxy-cli
+go.work
+go.work.sum
