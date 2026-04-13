@@ -135,13 +135,17 @@ func (p *proxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 			return
 		}
 		log.Debug().Str("domain", host).Str("adnl", newHost).Msg("multi-chain resolved")
-		req.Host = newHost
+		// Keep the original Host header (e.g. "tonnet.eth") so the remote
+		// server's nginx can match its server_name. Only rewrite URL.Host
+		// so the RLDP transport routes to the correct .adnl address.
 		req.URL.Host = newHost
 	}
 
 	var c = http.DefaultClient
+	urlHost := req.URL.Host
 	if strings.HasSuffix(req.Host, ".ton") || strings.HasSuffix(req.Host, ".adnl") ||
-		strings.HasSuffix(req.Host, ".t.me") || strings.HasSuffix(req.Host, ".bag") {
+		strings.HasSuffix(req.Host, ".t.me") || strings.HasSuffix(req.Host, ".bag") ||
+		strings.HasSuffix(urlHost, ".adnl") {
 		log.Debug().Str("method", req.Method).Str("url", req.URL.String()).Msg("over rldp")
 		// proxy requests to ton using special client
 		c = client
