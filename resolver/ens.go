@@ -15,10 +15,10 @@ func init() {
 		Name:      "Ethereum ENS",
 		RecordKey: ADNLRecordKey,
 		DefaultRPCs: []string{
-			"https://eth.drpc.org",
 			"https://ethereum-rpc.publicnode.com",
 			"https://cloudflare-eth.com",
 			"https://1rpc.io/eth",
+			"https://eth.drpc.org",
 		},
 		NewResolver: func(rpcURL string) (Resolver, error) {
 			return newENSResolver(rpcURL)
@@ -61,23 +61,30 @@ func (r *ENSResolver) Resolve(domain string) (string, error) {
 			return
 		}
 
-		adnlAddr, err := resolver.Text(ADNLRecordKey)
-		if err != nil {
-			ch <- result{"", fmt.Errorf("read ADNL record for %q: %w", domain, err)}
+		// ENSIP-7 contenthash (standard approach)
+		raw, chErr := resolver.Contenthash()
+		if chErr != nil {
+			ch <- result{"", fmt.Errorf("read contenthash for %q: %w", domain, chErr)}
 			return
 		}
 
-		if adnlAddr == "" {
-			ch <- result{"", fmt.Errorf("no ADNL record set for %q", domain)}
+		if len(raw) == 0 {
+			ch <- result{"", fmt.Errorf("no contenthash set for %q", domain)}
 			return
 		}
 
-		if _, err := ParseADNLAddress(adnlAddr); err != nil {
-			ch <- result{"", fmt.Errorf("invalid ADNL record for %q: %w", domain, err)}
+		hexAdnl, ok, extractErr := ExtractADNLFromContenthash(raw)
+		if extractErr != nil {
+			ch <- result{"", fmt.Errorf("parse contenthash for %q: %w", domain, extractErr)}
 			return
 		}
 
-		ch <- result{adnlAddr, nil}
+		if !ok {
+			ch <- result{"", fmt.Errorf("contenthash codec not supported for %q (expected adnl)", domain)}
+			return
+		}
+
+		ch <- result{hexAdnl, nil}
 	}()
 
 	select {
