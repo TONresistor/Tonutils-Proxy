@@ -3,25 +3,13 @@ package config
 import (
 	"crypto/ed25519"
 	"encoding/json"
-	tunnelConfig "github.com/ton-blockchain/adnl-tunnel/config"
 	"os"
-	"path/filepath"
 	"sync"
 )
-
-type ResolverConfig struct {
-	RPCOverrides map[string]string `json:"RPCOverrides,omitempty"`
-	Disabled     []string          `json:"Disabled,omitempty"`
-}
 
 type Config struct {
 	Version uint
 	ADNLKey []byte
-
-	CustomTunnelNetworkConfigPath string
-	TunnelConfig                  *tunnelConfig.ClientConfig
-
-	Resolver *ResolverConfig `json:"Resolver,omitempty"`
 
 	mx sync.Mutex
 }
@@ -38,11 +26,6 @@ func LoadConfig(dir string) (*Config, error) {
 		cfg = &Config{
 			Version: 1,
 			ADNLKey: priv.Seed(),
-		}
-
-		cfg.TunnelConfig, err = tunnelConfig.GenerateClientConfig()
-		if err != nil {
-			return nil, err
 		}
 
 		if err = cfg.SaveConfig(dir); err != nil {
@@ -72,22 +55,11 @@ func LoadConfig(dir string) (*Config, error) {
 	}
 
 	if cfg.Version < 1 {
-		var err error
-
 		cfg.Version = 1
-		cfg.TunnelConfig, err = tunnelConfig.GenerateClientConfig()
-		if err != nil {
+
+		if err := cfg.SaveConfig(dir); err != nil {
 			return nil, err
 		}
-
-		err = cfg.SaveConfig(dir)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	if cfg.TunnelConfig != nil && cfg.TunnelConfig.TunnelSectionsNum >= 2 && cfg.TunnelConfig.NodesPoolConfigPath == "" {
-		cfg.TunnelConfig.NodesPoolConfigPath = filepath.Join(filepath.Dir(path), "tunnel-nodes-cache.json")
 	}
 
 	return cfg, nil
