@@ -508,7 +508,7 @@ func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.
 		State: "Starting HTTP server...",
 	})
 
-	t := transport.NewTransport(gateProxy, dhtClient, dnsClient, conn, store)
+	t := transport.NewTransport(gateProxy, dhtClient, dnsClient, connPool, conn, store)
 	client = &http.Client{
 		Transport: t,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -584,12 +584,10 @@ func initDNSResolver(cfg *liteclient.GlobalConfig) (*liteclient.ConnectionPool, 
 		return nil, nil, err
 	}
 
-	// initialize ton api lite connection wrapper
-	api := ton.NewAPIClient(pool)
+	api := ton.NewAPIClient(pool).WithTimeout(5 * time.Second).WithRetry()
 
 	var root *address.Address
-	for i := 0; i < 5; i++ { // retry to not get liteserver not found block err
-		// get root dns address from network config
+	for i := 0; i < 5; i++ { // retry to absorb transient "block not found" from liteserver at startup
 		root, err = dns.GetRootContractAddr(context.Background(), api)
 		if err != nil {
 			time.Sleep(500 * time.Millisecond)

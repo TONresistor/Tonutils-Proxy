@@ -11,6 +11,7 @@ import (
 	"github.com/xssnick/tonutils-go/adnl"
 	"github.com/xssnick/tonutils-go/adnl/address"
 	"github.com/xssnick/tonutils-go/adnl/rldp"
+	"github.com/xssnick/tonutils-go/liteclient"
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/ton/dns"
 	"github.com/xssnick/tonutils-storage/storage"
@@ -112,6 +113,7 @@ type rldpInfo struct {
 type Transport struct {
 	dht              DHT
 	resolver         Resolver
+	pool             *liteclient.ConnectionPool
 	storageConnector storage.NetConnector
 	store            *VirtualStorage
 	gate             *adnl.Gateway
@@ -124,11 +126,12 @@ type Transport struct {
 	mx             sync.RWMutex
 }
 
-func NewTransport(gate *adnl.Gateway, dht DHT, resolver Resolver, storeConn storage.NetConnector, store *VirtualStorage) *Transport {
+func NewTransport(gate *adnl.Gateway, dht DHT, resolver Resolver, pool *liteclient.ConnectionPool, storeConn storage.NetConnector, store *VirtualStorage) *Transport {
 	t := &Transport{
 		gate:             gate,
 		dht:              dht,
 		resolver:         resolver,
+		pool:             pool,
 		storageConnector: storeConn,
 		store:            store,
 		activeRequests:   map[string]*payloadStream{},
@@ -763,7 +766,7 @@ func (t *Transport) resolve(ctx context.Context, host string) (_ any, err error)
 				for attempt := 0; attempt < _MaxResolveRetries; attempt++ {
 					// each new thread has bigger timeout, to cover users with high ping
 					resolveCtx, cancel := context.WithTimeout(lookupCtx, time.Duration((i+1)*2)*time.Second)
-					domain, err := t.resolver.Resolve(resolveCtx, host)
+					domain, err := t.resolver.Resolve(t.pool.StickyContext(resolveCtx), host)
 					cancel()
 					if err != nil {
 						if lookupCtx.Err() != nil {

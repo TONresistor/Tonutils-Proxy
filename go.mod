@@ -11,7 +11,7 @@ require (
 	github.com/sigurn/crc16 v0.0.0-20240131213347-83fcde1e29d1
 	github.com/ton-blockchain/adnl-tunnel v0.1.8
 	github.com/wealdtech/go-ens/v3 v3.6.0
-	github.com/xssnick/tonutils-go v1.15.5
+	github.com/xssnick/tonutils-go v1.16.0
 	github.com/xssnick/tonutils-storage v1.3.1
 )
 
