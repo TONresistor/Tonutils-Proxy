@@ -1,0 +1,36 @@
+# Git & CI
+.git
+.github
+.gitignore
+
+# Editeurs & outils
+.obsidian
+.claude
+.idea
+.vscode
+
+# Artefacts de build
+build
+proxy-cli
+proxy/window
+*.so
+*.exe
+*.dll
+.DS_Store
+
+# Donnees runtime & secrets - ne jamais embarquer dans l'image
+payments-db
+*.json
+!*.json.example
+
+# Go workspace (dev local uniquement)
+go.work
+go.work.sum
+
+# Docs
+*.md
+LICENSE
+
+# Docker
+Dockerfile
+.dockerignore

@@ -56,7 +56,7 @@ func isBlockedResponseHeader(name string) bool {
 }
 
 type DHT interface {
-	StoreAddress(ctx context.Context, addresses address.List, ttl time.Duration, ownerKey ed25519.PrivateKey, copies int) (int, []byte, error)
+	StoreAddress(ctx context.Context, addresses address.List, ttl time.Duration, ownerKey ed25519.PrivateKey) (int, []byte, error)
 	FindAddresses(ctx context.Context, key []byte) (*address.List, ed25519.PublicKey, error)
 	Close()
 }
@@ -854,7 +854,7 @@ func (t *Transport) resolve(ctx context.Context, host string) (_ any, err error)
 	connCh := make(chan connResult, len(addrList))
 
 	for _, v := range addrList {
-		addr := fmt.Sprintf("%s:%d", v.IP.String(), v.Port)
+		addr := fmt.Sprintf("%s:%d", address.IPValue(v).String(), address.PortValue(v))
 		log.Info().Str("host", host).Str("node", hex.EncodeToString(id)).Str("address", addr).Msg("connecting to ton site")
 		go func(addr string) {
 			c, err := t.connectRLDP(pubKey, addr, host)
