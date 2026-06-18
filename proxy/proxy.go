@@ -362,8 +362,8 @@ func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.
 					log.Info().Msg("tunnel updated")
 
 					e.Tunnel.SetOutAddressChangedHandler(func(addr *net.UDPAddr) {
-						gate.SetAddressList([]*adnlAddress.UDP{
-							{
+						gate.SetAddressList([]adnlAddress.Address{
+							&adnlAddress.UDP{
 								IP:   addr.IP,
 								Port: int32(addr.Port),
 							},
@@ -394,8 +394,8 @@ func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.
 						default:
 						}
 					} else {
-						gate.SetAddressList([]*adnlAddress.UDP{
-							{
+						gate.SetAddressList([]adnlAddress.Address{
+							&adnlAddress.UDP{
 								IP:   e.ExtIP,
 								Port: int32(e.ExtPort),
 							},
@@ -508,7 +508,7 @@ func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.
 		State: "Starting HTTP server...",
 	})
 
-	t := transport.NewTransport(gateProxy, dhtClient, dnsClient, conn, store)
+	t := transport.NewTransport(gateProxy, dhtClient, dnsClient, connPool, conn, store)
 	client = &http.Client{
 		Transport: t,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -584,12 +584,10 @@ func initDNSResolver(cfg *liteclient.GlobalConfig) (*liteclient.ConnectionPool, 
 		return nil, nil, err
 	}
 
-	// initialize ton api lite connection wrapper
-	api := ton.NewAPIClient(pool)
+	api := ton.NewAPIClient(pool).WithRetryTimeout(0, 5*time.Second)
 
 	var root *address.Address
-	for i := 0; i < 5; i++ { // retry to not get liteserver not found block err
-		// get root dns address from network config
+	for i := 0; i < 5; i++ { // retry to absorb transient "block not found" from liteserver at startup
 		root, err = dns.GetRootContractAddr(context.Background(), api)
 		if err != nil {
 			time.Sleep(500 * time.Millisecond)
