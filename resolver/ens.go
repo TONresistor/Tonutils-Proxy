@@ -15,10 +15,10 @@ func init() {
 		Name:      "Ethereum ENS",
 		RecordKey: ADNLRecordKey,
 		DefaultRPCs: []string{
-			"https://eth.drpc.org",
 			"https://ethereum-rpc.publicnode.com",
 			"https://cloudflare-eth.com",
 			"https://1rpc.io/eth",
+			"https://eth.drpc.org",
 		},
 		NewResolver: func(rpcURL string) (Resolver, error) {
 			return newENSResolver(rpcURL)
@@ -61,23 +61,23 @@ func (r *ENSResolver) Resolve(domain string) (string, error) {
 			return
 		}
 
-		adnlAddr, err := resolver.Text(ADNLRecordKey)
-		if err != nil {
-			ch <- result{"", fmt.Errorf("read ADNL record for %q: %w", domain, err)}
-			return
+		// Preferred: ENSIP-7 contenthash carrying the official ADNL multicodec (0xb69910).
+		if raw, chErr := resolver.Contenthash(); chErr == nil && len(raw) > 0 {
+			if hexAdnl, ok, extractErr := ExtractADNLFromContenthash(raw); extractErr == nil && ok {
+				ch <- result{hexAdnl, nil}
+				return
+			}
 		}
 
-		if adnlAddr == "" {
-			ch <- result{"", fmt.Errorf("no ADNL record set for %q", domain)}
-			return
+		// Backward-compatible fallback: legacy "adnl" text record (pre-ENSIP-7 setups).
+		if adnlAddr, txtErr := resolver.Text(ADNLRecordKey); txtErr == nil && adnlAddr != "" {
+			if _, parseErr := ParseADNLAddress(adnlAddr); parseErr == nil {
+				ch <- result{adnlAddr, nil}
+				return
+			}
 		}
 
-		if _, err := ParseADNLAddress(adnlAddr); err != nil {
-			ch <- result{"", fmt.Errorf("invalid ADNL record for %q: %w", domain, err)}
-			return
-		}
-
-		ch <- result{adnlAddr, nil}
+		ch <- result{"", fmt.Errorf("no ADNL contenthash (adnl multicodec) or %q text record for %q", ADNLRecordKey, domain)}
 	}()
 
 	select {
