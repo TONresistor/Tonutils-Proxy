@@ -63,11 +63,9 @@ func TestExtractADNLFromContenthash_Valid(t *testing.T) {
 }
 
 func TestExtractADNLFromContenthash_UnknownCodec(t *testing.T) {
-	// sha256 codec (0x12) + 32 bytes of hash
+	// Any codec != MulticodecADNL: use sha256 (0x12) followed by 32 bytes.
 	payload := make([]byte, 32)
-	ch := append([]byte{0x12, 0x20}, payload...) // 0x12 codec, 0x20 len prefix (still just bytes)
-	// Actually we just need ANY codec != MulticodecADNL; use 0x12 directly.
-	ch = append([]byte{0x12}, payload...)
+	ch := append([]byte{0x12}, payload...)
 
 	hexAdnl, ok, err := ExtractADNLFromContenthash(ch)
 	if err != nil {
