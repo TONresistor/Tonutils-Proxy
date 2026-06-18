@@ -61,30 +61,23 @@ func (r *ENSResolver) Resolve(domain string) (string, error) {
 			return
 		}
 
-		// ENSIP-7 contenthash (standard approach)
-		raw, chErr := resolver.Contenthash()
-		if chErr != nil {
-			ch <- result{"", fmt.Errorf("read contenthash for %q: %w", domain, chErr)}
-			return
+		// Preferred: ENSIP-7 contenthash carrying the official ADNL multicodec (0xb69910).
+		if raw, chErr := resolver.Contenthash(); chErr == nil && len(raw) > 0 {
+			if hexAdnl, ok, extractErr := ExtractADNLFromContenthash(raw); extractErr == nil && ok {
+				ch <- result{hexAdnl, nil}
+				return
+			}
 		}
 
-		if len(raw) == 0 {
-			ch <- result{"", fmt.Errorf("no contenthash set for %q", domain)}
-			return
+		// Backward-compatible fallback: legacy "adnl" text record (pre-ENSIP-7 setups).
+		if adnlAddr, txtErr := resolver.Text(ADNLRecordKey); txtErr == nil && adnlAddr != "" {
+			if _, parseErr := ParseADNLAddress(adnlAddr); parseErr == nil {
+				ch <- result{adnlAddr, nil}
+				return
+			}
 		}
 
-		hexAdnl, ok, extractErr := ExtractADNLFromContenthash(raw)
-		if extractErr != nil {
-			ch <- result{"", fmt.Errorf("parse contenthash for %q: %w", domain, extractErr)}
-			return
-		}
-
-		if !ok {
-			ch <- result{"", fmt.Errorf("contenthash codec not supported for %q (expected adnl)", domain)}
-			return
-		}
-
-		ch <- result{hexAdnl, nil}
+		ch <- result{"", fmt.Errorf("no ADNL contenthash (adnl multicodec) or %q text record for %q", ADNLRecordKey, domain)}
 	}()
 
 	select {

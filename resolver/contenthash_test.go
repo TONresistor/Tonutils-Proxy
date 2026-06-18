@@ -112,3 +112,30 @@ func TestDecodeContenthash_InvalidUvarint(t *testing.T) {
 		t.Fatalf("expected error for broken uvarint, got nil")
 	}
 }
+
+// TestExtractADNLFromContenthash_TonnetGolden pins the real on-chain contenthash of
+// tonnet.eth so a regression in the ADNL codec is caught offline (no network in CI).
+// Read 2026-06-18 from the ENS mainnet resolver via Contenthash():
+//
+//	90b2da05 (uvarint 0xb69910) || 61bd855d...ff6f4ae5 (32-byte ADNL)
+func TestExtractADNLFromContenthash_TonnetGolden(t *testing.T) {
+	const (
+		rawHex      = "90b2da0561bd855da6c07e8d1c807e880c2a9a6272011cfc2b34b2e9de32cd37ff6f4ae5"
+		wantADNLHex = "61bd855da6c07e8d1c807e880c2a9a6272011cfc2b34b2e9de32cd37ff6f4ae5"
+	)
+	raw, err := hex.DecodeString(rawHex)
+	if err != nil {
+		t.Fatalf("decode golden raw: %v", err)
+	}
+
+	got, ok, err := ExtractADNLFromContenthash(raw)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !ok {
+		t.Fatalf("ok = false, want true for tonnet.eth golden contenthash")
+	}
+	if got != wantADNLHex {
+		t.Fatalf("ADNL hex = %q, want %q", got, wantADNLHex)
+	}
+}
