@@ -412,8 +412,9 @@ func (t *Transport) RoundTrip(request *http.Request) (_ *http.Response, err erro
 		site.mx.Unlock()
 
 		if rldpClient != nil {
-			resp, err := t.doRldpHttp(rldpClient, host, request)
-			if err != nil {
+			resp, rErr := t.doRldpHttp(rldpClient, host, request)
+			if rErr != nil {
+				err = rErr // surface the real error (was shadowed by :=)
 				// Invalidate the cached RLDP connection so the next request
 				// reconnects instead of reusing a dead connection.
 				site.mx.Lock()
@@ -427,14 +428,18 @@ func (t *Transport) RoundTrip(request *http.Request) (_ *http.Response, err erro
 			return resp, nil
 		}
 
-		resp, err := t.doTorrent(torrent, request, site)
-		if err != nil {
+		resp, tErr := t.doTorrent(torrent, request, site)
+		if tErr != nil {
+			err = tErr
 			continue
 		}
 		atomic.StoreInt64(&site.LastSuccess, time.Now().Unix())
 		return resp, nil
 	}
 
+	if err == nil {
+		err = errors.New("site node did not return a response")
+	}
 	return nil, fmt.Errorf("failed to connect to site after %d attempts: %w", _RoundTripMaxRetries+1, err)
 }
 
@@ -742,9 +747,67 @@ func (t *Transport) doRldpHttp(client RLDP, host string, request *http.Request) 
 	return httpResp, nil
 }
 
+// dns_storage_address#7473 tag (unexported in tonutils-go).
+const dnsStorageCategory = 0x7473
+
+// storageBagFromDomain returns the bag id from a domain's "storage" record, or nil.
+func storageBagFromDomain(domain *dns.Domain) []byte {
+	if domain == nil {
+		return nil
+	}
+	rec := domain.GetRecord("storage")
+	if rec == nil {
+		return nil
+	}
+	s, err := rec.BeginParse()
+	if err != nil {
+		return nil
+	}
+	ref, err := s.LoadRef()
+	if err != nil {
+		return nil
+	}
+	category, err := ref.LoadUInt(16)
+	if err != nil || category != dnsStorageCategory {
+		return nil
+	}
+	bag, err := ref.LoadSlice(256)
+	if err != nil {
+		return nil
+	}
+	return bag
+}
+
+// startBag starts a TON Storage bag and returns its bagInfo actor.
+func (t *Transport) startBag(id []byte, host string) (*bagInfo, error) {
+	log.Info().Str("bag_id", hex.EncodeToString(id)).Str("host", host).Msg("searching for bag id")
+
+	torrent := storage.NewTorrent("", t.store, t.storageConnector)
+	torrent.BagID = id
+
+	_ = t.store.SetTorrent(torrent)
+
+	if err := torrent.Start(true, false, false); err != nil {
+		return nil, fmt.Errorf("failed to start bag %s, err: %w", host, err)
+	}
+	log.Info().Str("bag_id", hex.EncodeToString(id)).Str("host", host).Msg("starting for bag id")
+
+	downloader, err := t.storageConnector.CreateDownloader(t.globalCtx, torrent)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create downloader for storage bag of %s, err: %w", host, err)
+	}
+
+	log.Info().Str("bag_id", hex.EncodeToString(id)).Str("host", host).Msg("bag found")
+	return &bagInfo{
+		torrent:    torrent,
+		downloader: downloader,
+	}, nil
+}
+
 func (t *Transport) resolve(ctx context.Context, host string) (_ any, err error) {
 	var id []byte
 	var inStorage bool
+	var domain *dns.Domain
 	if strings.HasSuffix(host, ".adnl") {
 		id, err = ParseADNLAddress(host[:len(host)-5])
 		if err != nil {
@@ -787,7 +850,6 @@ func (t *Transport) resolve(ctx context.Context, host string) (_ any, err error)
 			}(i)
 		}
 
-		var domain *dns.Domain
 		select {
 		case domain = <-ch:
 			stopLookup()
@@ -803,29 +865,13 @@ func (t *Transport) resolve(ctx context.Context, host string) (_ any, err error)
 		id, inStorage = domain.GetSiteRecord()
 	}
 
+	if len(id) == 0 {
+		// no site record: fail clearly instead of the opaque DHT "key should have 256 bits"
+		return nil, fmt.Errorf("domain %s resolved but has no site record (no ADNL or TON Storage address is set on it)", host)
+	}
+
 	if inStorage {
-		log.Info().Str("bag_id", hex.EncodeToString(id)).Str("host", host).Msg("searching for bag id")
-
-		torrent := storage.NewTorrent("", t.store, t.storageConnector)
-		torrent.BagID = id
-
-		_ = t.store.SetTorrent(torrent)
-
-		if err = torrent.Start(true, false, false); err != nil {
-			return nil, fmt.Errorf("failed to start bag %s, err: %w", host, err)
-		}
-		log.Info().Str("bag_id", hex.EncodeToString(id)).Str("host", host).Msg("starting for bag id")
-
-		downloader, err := t.storageConnector.CreateDownloader(t.globalCtx, torrent)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create downloader for storage bag of %s, err: %w", host, err)
-		}
-
-		log.Info().Str("bag_id", hex.EncodeToString(id)).Str("host", host).Msg("bag found")
-		return &bagInfo{
-			torrent:    torrent,
-			downloader: downloader,
-		}, nil
+		return t.startBag(id, host)
 	}
 
 	log.Info().Str("host", host).Str("node", hex.EncodeToString(id)).Msg("resolving ton site address")
@@ -835,10 +881,18 @@ func (t *Transport) resolve(ctx context.Context, host string) (_ any, err error)
 
 	addresses, pubKey, err := t.dht.FindAddresses(dhtCtx, id)
 	if err != nil {
+		if bag := storageBagFromDomain(domain); bag != nil {
+			log.Warn().Str("host", host).Err(err).Msg("ADNL site not found in DHT, falling back to TON Storage record")
+			return t.startBag(bag, host)
+		}
 		return nil, fmt.Errorf("failed to find address of %s (%s) in DHT, err: %w", host, hex.EncodeToString(id), err)
 	}
 
 	if len(addresses.Addresses) == 0 {
+		if bag := storageBagFromDomain(domain); bag != nil {
+			log.Warn().Str("host", host).Msg("ADNL site has no addresses in DHT, falling back to TON Storage record")
+			return t.startBag(bag, host)
+		}
 		return nil, fmt.Errorf("failed to find address of %s (%s) in DHT,no addresses in record", host, hex.EncodeToString(id))
 	}
 
