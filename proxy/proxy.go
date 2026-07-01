@@ -80,7 +80,6 @@ func delHopHeaders(header http.Header) {
 	}
 }
 
-
 type proxy struct {
 	version       string
 	blockHttp     bool
@@ -196,7 +195,12 @@ type MultiChainConfig struct {
 	Disabled map[string]bool
 }
 
-func RunProxy(closerCtx context.Context, addr string, adnlKey ed25519.PrivateKey, res chan<- State, versionAndDevice string, blockHttp bool, netConfigPath string, tunCfg *tunnelConfig.ClientConfig, customTunNetCfg *liteclient.GlobalConfig, multiChainCfg *MultiChainConfig) error {
+type Forward struct {
+	Listen string
+	Target string
+}
+
+func RunProxy(closerCtx context.Context, addr string, adnlKey ed25519.PrivateKey, res chan<- State, versionAndDevice string, blockHttp bool, netConfigPath string, tunCfg *tunnelConfig.ClientConfig, customTunNetCfg *liteclient.GlobalConfig, multiChainCfg *MultiChainConfig, forwards []Forward) error {
 	if res != nil {
 		res <- State{
 			Type:  "loading",
@@ -224,7 +228,7 @@ func RunProxy(closerCtx context.Context, addr string, adnlKey ed25519.PrivateKey
 		}
 	}
 
-	return RunProxyWithConfig(closerCtx, addr, adnlKey, res, blockHttp, versionAndDevice, lsCfg, tunCfg, customTunNetCfg, multiChainCfg)
+	return RunProxyWithConfig(closerCtx, addr, adnlKey, res, blockHttp, versionAndDevice, lsCfg, tunCfg, customTunNetCfg, multiChainCfg, forwards)
 }
 
 var OnTunnel = func(addr string) {}
@@ -237,7 +241,7 @@ var OnAskReroute = func() bool { return false }
 
 var OnTunnelStopped = func() {}
 
-func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.PrivateKey, res chan<- State, blockHttp bool, versionAndDevice string, lsCfg *liteclient.GlobalConfig, tunCfg *tunnelConfig.ClientConfig, customTunNetCfg *liteclient.GlobalConfig, multiChainCfg *MultiChainConfig) error {
+func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.PrivateKey, res chan<- State, blockHttp bool, versionAndDevice string, lsCfg *liteclient.GlobalConfig, tunCfg *tunnelConfig.ClientConfig, customTunNetCfg *liteclient.GlobalConfig, multiChainCfg *MultiChainConfig, forwards []Forward) error {
 	report := func(s State) {
 		if res != nil {
 			res <- s
@@ -517,6 +521,14 @@ func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.
 	}
 	defer t.Stop()
 
+	validForwards, fwWarnings := validateForwards(forwards, append([]string{".adnl", ".ton"}, multiRes.EnabledTLDs()...))
+	for _, w := range fwWarnings {
+		log.Warn().Str("warning", w).Msg("local forward config")
+	}
+	for _, f := range validForwards {
+		startForward(ctx, f, blockHttp, versionAndDevice, multiRes)
+	}
+
 	log.Info().Str("address", addr).Msg("Starting proxy server")
 
 	server := http.Server{
@@ -574,6 +586,90 @@ func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.
 	}
 
 	return err
+}
+
+func validateForwards(forwards []Forward, routableSuffixes []string) (valid []Forward, warnings []string) {
+	index := make(map[string]int)
+	for _, f := range forwards {
+		listen := strings.TrimSpace(f.Listen)
+		host, port, err := net.SplitHostPort(listen)
+		if err != nil || port == "" {
+			warnings = append(warnings, fmt.Sprintf("forward %q: invalid listen address, skipped", f.Listen))
+			continue
+		}
+
+		target := strings.TrimSuffix(strings.TrimSpace(f.Target), "/")
+		if target == "" {
+			warnings = append(warnings, fmt.Sprintf("forward %q: empty target, skipped", f.Listen))
+			continue
+		}
+		if !strings.Contains(target, ".") {
+			target += ".adnl"
+		} else if !hasAnySuffix(target, routableSuffixes) {
+			warnings = append(warnings, fmt.Sprintf("forward %q: target %q has no routable suffix (%s), it will be treated as a clearnet host", f.Listen, target, strings.Join(routableSuffixes, ", ")))
+		}
+
+		if !isLoopbackHost(host) {
+			warnings = append(warnings, fmt.Sprintf("forward %q: binds a non-loopback address, the service will be reachable by other hosts on the network", f.Listen))
+		}
+
+		nf := Forward{Listen: listen, Target: target}
+		if i, ok := index[listen]; ok {
+			warnings = append(warnings, fmt.Sprintf("forward %q: duplicate listen address, keeping the last target %q", f.Listen, target))
+			valid[i] = nf
+			continue
+		}
+		index[listen] = len(valid)
+		valid = append(valid, nf)
+	}
+	return valid, warnings
+}
+
+func hasAnySuffix(s string, suffixes []string) bool {
+	for _, suf := range suffixes {
+		if strings.HasSuffix(s, suf) {
+			return true
+		}
+	}
+	return false
+}
+
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+func startForward(ctx context.Context, f Forward, blockHttp bool, version string, mr *resolver.MultiResolver) {
+	ph := &proxy{blockHttp: blockHttp, version: version, multiResolver: mr}
+	srv := &http.Server{
+		Addr: f.Listen,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			r.URL.Scheme = "http"
+			r.URL.Host = f.Target
+			r.Host = f.Target
+			ph.ServeHTTP(w, r)
+		}),
+		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      120 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	go func() {
+		<-ctx.Done()
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		srv.Shutdown(shutCtx)
+	}()
+	go func() {
+		log.Info().Str("listen", f.Listen).Str("target", f.Target).Msg("Local forward started")
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Error().Err(err).Str("listen", f.Listen).Msg("Local forward listener failed")
+		}
+	}()
 }
 
 func initDNSResolver(cfg *liteclient.GlobalConfig) (*liteclient.ConnectionPool, *dns.Client, error) {

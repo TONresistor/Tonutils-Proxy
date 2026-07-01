@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	tunnelConfig "github.com/ton-blockchain/adnl-tunnel/config"
@@ -18,6 +19,25 @@ import (
 
 var GitCommit = "dev"
 
+type forwardFlags []proxy.Forward
+
+func (f *forwardFlags) String() string {
+	parts := make([]string, 0, len(*f))
+	for _, x := range *f {
+		parts = append(parts, x.Listen+"="+x.Target)
+	}
+	return strings.Join(parts, ",")
+}
+
+func (f *forwardFlags) Set(v string) error {
+	i := strings.Index(v, "=")
+	if i <= 0 || i == len(v)-1 {
+		return fmt.Errorf("expected LISTEN=TARGET, got %q", v)
+	}
+	*f = append(*f, proxy.Forward{Listen: v[:i], Target: v[i+1:]})
+	return nil
+}
+
 func main() {
 	var addr = flag.String("addr", "127.0.0.1:8080", "The addr of the proxy.")
 	var verbosity = flag.Int("verbosity", 2, "Debug logs")
@@ -28,6 +48,8 @@ func main() {
 	var noEth = flag.Bool("no-eth", false, "Disable .eth domain resolution")
 	var solRPC = flag.String("sol-rpc", "", "Custom Solana RPC endpoint for SNS resolution")
 	var noSol = flag.Bool("no-sol", false, "Disable .sol domain resolution")
+	var forwards forwardFlags
+	flag.Var(&forwards, "forward", "Expose an ADNL service on a local port, repeatable: LISTEN=TARGET (e.g. 127.0.0.1:18090=<adnl>)")
 
 	flag.Parse()
 
@@ -113,8 +135,14 @@ func main() {
 		}
 	}
 
+	var fwd []proxy.Forward
+	for _, f := range cfg.Forwards {
+		fwd = append(fwd, proxy.Forward{Listen: f.Listen, Target: f.Target})
+	}
+	fwd = append(fwd, forwards...)
+
 	go func() {
-		err = proxy.RunProxy(closerCtx, *addr, cfg.ADNLKey, nil, "CLI "+GitCommit, *blockHttp, *networkConfigPath, cfg.TunnelConfig, customTinNetCfg, multiChainCfg)
+		err = proxy.RunProxy(closerCtx, *addr, cfg.ADNLKey, nil, "CLI "+GitCommit, *blockHttp, *networkConfigPath, cfg.TunnelConfig, customTinNetCfg, multiChainCfg, fwd)
 		if err != nil {
 			log.Fatal().Err(err).Msg("proxy failed")
 		}

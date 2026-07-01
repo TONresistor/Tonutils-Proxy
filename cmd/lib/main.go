@@ -86,9 +86,9 @@ func startProxy(port uint16, netCfg *liteclient.GlobalConfig) string {
 	var ch = make(chan proxy.State, 1)
 	go func() {
 		if netCfg != nil {
-			err = proxy.RunProxyWithConfig(ActiveProxy, "127.0.0.1:"+fmt.Sprint(port), cfg.ADNLKey, ch, false, "LIB "+GitCommit, netCfg, cfg.TunnelConfig, customTunNetCfg, multiChainCfg)
+			err = proxy.RunProxyWithConfig(ActiveProxy, "127.0.0.1:"+fmt.Sprint(port), cfg.ADNLKey, ch, false, "LIB "+GitCommit, netCfg, cfg.TunnelConfig, customTunNetCfg, multiChainCfg, nil)
 		} else {
-			err = proxy.RunProxy(ActiveProxy, "127.0.0.1:"+fmt.Sprint(port), cfg.ADNLKey, ch, "LIB "+GitCommit, false, "", cfg.TunnelConfig, customTunNetCfg, multiChainCfg)
+			err = proxy.RunProxy(ActiveProxy, "127.0.0.1:"+fmt.Sprint(port), cfg.ADNLKey, ch, "LIB "+GitCommit, false, "", cfg.TunnelConfig, customTunNetCfg, multiChainCfg, nil)
 		}
 		if err != nil {
 			log.Println("failed to start proxy:", err.Error())

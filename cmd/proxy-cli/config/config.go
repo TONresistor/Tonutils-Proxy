@@ -14,6 +14,11 @@ type ResolverConfig struct {
 	Disabled     []string          `json:"Disabled,omitempty"`
 }
 
+type ForwardConfig struct {
+	Listen string `json:"Listen"`
+	Target string `json:"Target"`
+}
+
 type Config struct {
 	Version uint
 	ADNLKey []byte
@@ -22,6 +27,8 @@ type Config struct {
 	TunnelConfig                  *tunnelConfig.ClientConfig
 
 	Resolver *ResolverConfig `json:"Resolver,omitempty"`
+
+	Forwards []ForwardConfig `json:"Forwards,omitempty"`
 
 	mx sync.Mutex
 }
