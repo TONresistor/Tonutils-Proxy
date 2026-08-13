@@ -6,6 +6,24 @@ Forked from [xssnick/Tonutils-Proxy](https://github.com/xssnick/Tonutils-Proxy) 
 
 ## [Unreleased]
 
+## [v1.10.1] - 2026-08-13
+
+### Added
+
+- Local TCP-to-ADNL forwarding through the CLI and mobile library.
+- TON Storage fallback when a domain's ADNL site cannot be reached.
+
+### Fixed
+
+- Surface the real TON Site transport error and reconnect after failed RLDP requests.
+- Cancel pending TON Storage discovery with its HTTP request; clean replaced, failed, idle, and globally stopped actors; and keep active response streams protected from idle eviction.
+
+### Changed
+
+- Upgrade to Go 1.26 and `tonutils-go v1.18.1-0.20260801052814-fc795b3d6ca7`.
+
+## [v1.10.0] - 2026-06-20
+
 ### Added
 
 - **Multi-chain domain resolution**: resolve `.eth` (ENS) and `.sol` (SNS) domains to TON Sites via ADNL addresses

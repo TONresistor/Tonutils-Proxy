@@ -62,6 +62,20 @@ func (v *VirtualStorage) SetTorrent(t *storage.Torrent) error {
 	return nil
 }
 
+func (v *VirtualStorage) RemoveTorrent(t *storage.Torrent) {
+	id, err := tl.Hash(keys.PublicKeyOverlay{Key: t.BagID})
+	if err != nil {
+		return
+	}
+
+	v.mx.Lock()
+	defer v.mx.Unlock()
+
+	if v.torrents[string(id)] == t {
+		delete(v.torrents, string(id))
+	}
+}
+
 func (v *VirtualStorage) SetActiveFiles(bagId []byte, ids []uint32) error {
 	panic("virtual")
 }

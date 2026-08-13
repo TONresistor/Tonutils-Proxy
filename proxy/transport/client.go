@@ -89,6 +89,42 @@ type ADNL interface {
 type bagInfo struct {
 	torrent    *storage.Torrent
 	downloader storage.TorrentDownloader
+	stop       context.CancelFunc
+}
+
+func (b *bagInfo) close() {
+	b.downloader.Close()
+	b.stop()
+	b.torrent.Stop()
+}
+
+type downloaderResult struct {
+	downloader storage.TorrentDownloader
+	err        error
+}
+
+func createPersistentDownloader(requestCtx, globalCtx context.Context, create func(context.Context) (storage.TorrentDownloader, error)) (storage.TorrentDownloader, context.CancelFunc, error) {
+	downloaderCtx, stop := context.WithCancel(globalCtx)
+	result := make(chan downloaderResult, 1)
+	go func() {
+		downloader, err := create(downloaderCtx)
+		result <- downloaderResult{downloader: downloader, err: err}
+	}()
+
+	select {
+	case res := <-result:
+		if res.err != nil {
+			stop()
+			return nil, nil, res.err
+		}
+		return res.downloader, stop, nil
+	case <-requestCtx.Done():
+		stop()
+		return nil, nil, requestCtx.Err()
+	case <-globalCtx.Done():
+		stop()
+		return nil, nil, globalCtx.Err()
+	}
 }
 
 var newRLDP = func(a ADNL) RLDP {
@@ -98,9 +134,16 @@ var newRLDP = func(a ADNL) RLDP {
 type siteInfo struct {
 	Actor any
 
-	LastUsed    int64
-	LastSuccess int64
-	mx          sync.RWMutex
+	LastUsed      int64
+	LastSuccess   int64
+	ActiveStreams int64
+	mx            sync.RWMutex
+}
+
+func (s *siteInfo) replaceActor(t *Transport, actor any) {
+	old := s.Actor
+	s.Actor = actor
+	t.closeActor(old)
 }
 
 type rldpInfo struct {
@@ -123,6 +166,7 @@ type Transport struct {
 	activeRequests map[string]*payloadStream
 	globalCtx      context.Context
 	stop           func()
+	cleanerDone    chan struct{}
 	mx             sync.RWMutex
 }
 
@@ -136,6 +180,7 @@ func NewTransport(gate *adnl.Gateway, dht DHT, resolver Resolver, pool *liteclie
 		store:            store,
 		activeRequests:   map[string]*payloadStream{},
 		activeSites:      map[string]*siteInfo{},
+		cleanerDone:      make(chan struct{}),
 	}
 	t.globalCtx, t.stop = context.WithCancel(context.Background())
 	go t.cleaner()
@@ -144,9 +189,39 @@ func NewTransport(gate *adnl.Gateway, dht DHT, resolver Resolver, pool *liteclie
 
 func (t *Transport) Stop() {
 	t.stop()
+	<-t.cleanerDone
+
+	t.mx.Lock()
+	sites := t.activeSites
+	t.activeSites = map[string]*siteInfo{}
+	t.mx.Unlock()
+
+	for _, info := range sites {
+		info.mx.Lock()
+		info.replaceActor(t, nil)
+		info.mx.Unlock()
+	}
+}
+
+func (t *Transport) closeActor(actor any) {
+	switch act := actor.(type) {
+	case *bagInfo:
+		act.close()
+		if t.store != nil {
+			t.store.RemoveTorrent(act.torrent)
+		}
+	case *rldpInfo:
+		if act.ActiveClient != nil {
+			act.destroyClient(act.ActiveClient)
+		}
+	}
 }
 
 func (t *Transport) cleaner() {
+	if t.cleanerDone != nil {
+		defer close(t.cleanerDone)
+	}
+
 	for {
 		select {
 		case <-t.globalCtx.Done():
@@ -154,8 +229,8 @@ func (t *Transport) cleaner() {
 		case <-time.After(3 * time.Second):
 		}
 
-		sites := make(map[string]*siteInfo, len(t.activeSites))
 		t.mx.RLock()
+		sites := make(map[string]*siteInfo, len(t.activeSites))
 		for s, info := range t.activeSites {
 			sites[s] = info
 		}
@@ -163,25 +238,49 @@ func (t *Transport) cleaner() {
 
 		now := time.Now().Unix()
 		for s, info := range sites {
-			if info.mx.TryLock() {
-				// stop bags that was not used for > 5 min
-				if atomic.LoadInt64(&info.LastUsed)+300 < now {
-					switch act := info.Actor.(type) {
-					case *bagInfo:
-						t.mx.Lock()
-						if t.activeSites[s] == info {
-							delete(t.activeSites, s)
-						}
-						t.mx.Unlock()
-						act.downloader.Close()
-						act.torrent.Stop()
-
-						log.Debug().Hex("bag_id", act.torrent.BagID).Msg("stopped unused bag")
-					}
-				}
-				info.mx.Unlock()
+			t.mx.Lock()
+			if t.activeSites[s] != info || !info.mx.TryLock() {
+				t.mx.Unlock()
+				continue
 			}
+
+			idle := atomic.LoadInt64(&info.ActiveStreams) == 0 && atomic.LoadInt64(&info.LastUsed)+300 < now
+			if idle {
+				delete(t.activeSites, s)
+			}
+			t.mx.Unlock()
+
+			if idle {
+				actor := info.Actor
+				info.Actor = nil
+				t.closeActor(actor)
+				if act, ok := actor.(*bagInfo); ok {
+					log.Debug().Hex("bag_id", act.torrent.BagID).Msg("stopped unused bag")
+				}
+			}
+			info.mx.Unlock()
 		}
+	}
+}
+
+func (t *Transport) lockSite(host string) *siteInfo {
+	for {
+		t.mx.Lock()
+		site := t.activeSites[host]
+		if site == nil {
+			site = &siteInfo{LastUsed: time.Now().Unix()}
+			t.activeSites[host] = site
+		}
+		t.mx.Unlock()
+
+		site.mx.Lock()
+		t.mx.RLock()
+		current := t.activeSites[host]
+		t.mx.RUnlock()
+		if current == site {
+			return site
+		}
+		site.mx.Unlock()
 	}
 }
 
@@ -330,11 +429,14 @@ func (s *siteInfo) prepareWithDepth(t *Transport, request *http.Request, depth i
 		host = request.Host
 	}
 
-	if s.Actor == nil || atomic.LoadInt64(&s.LastSuccess)+90 < time.Now().Unix() {
-		s.Actor, err = t.resolve(request.Context(), host)
+	stale := atomic.LoadInt64(&s.LastSuccess)+90 < time.Now().Unix()
+	if s.Actor == nil || (stale && atomic.LoadInt64(&s.ActiveStreams) == 0) {
+		actor, resolveErr := t.resolve(request.Context(), host)
+		err = resolveErr
 		if err != nil {
 			return err
 		}
+		s.replaceActor(t, actor)
 		// update success after resolve to not re-resolve too soon
 		atomic.StoreInt64(&s.LastSuccess, time.Now().Unix())
 		atomic.StoreInt64(&s.LastUsed, time.Now().Unix())
@@ -353,7 +455,7 @@ func (s *siteInfo) prepareWithDepth(t *Transport, request *http.Request, depth i
 			act.ActiveClient, err = t.connectRLDP(act.ID, act.Addr, host)
 			if err != nil {
 				// resolve again
-				s.Actor = nil
+				s.replaceActor(t, nil)
 				return s.prepareWithDepth(t, request, depth+1)
 			}
 			atomic.StoreInt64(&s.LastUsed, time.Now().Unix())
@@ -371,30 +473,22 @@ func (t *Transport) RoundTrip(request *http.Request) (_ *http.Response, err erro
 		host = request.Host
 	}
 
-	t.mx.Lock()
-	site := t.activeSites[host]
-	if site == nil {
-		site = &siteInfo{
-			LastUsed: time.Now().Unix(),
-		}
-		t.activeSites[host] = site
-	}
-	t.mx.Unlock()
+	// Lock outside the global map mutex, then revalidate the exact entry. This
+	// prevents cleaner detachment without blocking unrelated hosts.
+	site := t.lockSite(host)
 
 	for attempt := 0; attempt <= _RoundTripMaxRetries; attempt++ {
 		if attempt > 0 {
 			log.Info().Int("attempt", attempt+1).Str("host", host).Msg("retrying connection")
 			// Force re-resolve on retry.
 			site.mx.Lock()
-			site.Actor = nil
-			site.mx.Unlock()
+			site.replaceActor(t, nil)
 		}
 
 		var rldpClient RLDP
 		var torrent *bagInfo
 
 		tm := time.Now()
-		site.mx.Lock()
 		err = site.prepare(t, request)
 		log.Info().Str("host", host).Dur("took", time.Since(tm)).Msg("prepare took")
 
@@ -412,7 +506,7 @@ func (t *Transport) RoundTrip(request *http.Request) (_ *http.Response, err erro
 		site.mx.Unlock()
 
 		if rldpClient != nil {
-			resp, rErr := t.doRldpHttp(rldpClient, host, request)
+			resp, rErr := t.doRldpHttp(rldpClient, host, request, site)
 			if rErr != nil {
 				err = rErr // surface the real error (was shadowed by :=)
 				// Invalidate the cached RLDP connection so the next request
@@ -431,6 +525,11 @@ func (t *Transport) RoundTrip(request *http.Request) (_ *http.Response, err erro
 		resp, tErr := t.doTorrent(torrent, request, site)
 		if tErr != nil {
 			err = tErr
+			site.mx.Lock()
+			if site.Actor == torrent {
+				site.replaceActor(t, nil)
+			}
+			site.mx.Unlock()
 			continue
 		}
 		atomic.StoreInt64(&site.LastSuccess, time.Now().Unix())
@@ -558,8 +657,10 @@ func (t *Transport) doTorrent(bag *bagInfo, request *http.Request, si *siteInfo)
 		fetch := storage.NewPreFetcher(request.Context(), bag.torrent, func(event storage.Event) {}, 64, pieces)
 		stream := newDataStreamer()
 		httpResp.Body = stream
+		atomic.AddInt64(&si.ActiveStreams, 1)
 
 		go func() {
+			defer atomic.AddInt64(&si.ActiveStreams, -1)
 			defer fetch.Stop()
 
 			err := t.proxyOrdered(request.Context(), fileInfo, piecesMap, fetch, stream, si, bag.torrent.Info.PieceSize, from, to)
@@ -577,7 +678,15 @@ func (t *Transport) doTorrent(bag *bagInfo, request *http.Request, si *siteInfo)
 	return httpResp, nil
 }
 
-func (t *Transport) doRldpHttp(client RLDP, host string, request *http.Request) (*http.Response, error) {
+func (t *Transport) doRldpHttp(client RLDP, host string, request *http.Request, si *siteInfo) (*http.Response, error) {
+	atomic.AddInt64(&si.ActiveStreams, 1)
+	streamOwnsActivity := false
+	defer func() {
+		if !streamOwnsActivity {
+			atomic.AddInt64(&si.ActiveStreams, -1)
+		}
+	}()
+
 	qid := make([]byte, 32)
 	_, err := rand.Read(qid)
 	if err != nil {
@@ -708,7 +817,9 @@ func (t *Transport) doRldpHttp(client RLDP, host string, request *http.Request) 
 			dr.buf = make([]byte, 0, httpResp.ContentLength)
 		}
 
+		streamOwnsActivity = true
 		go func() {
+			defer atomic.AddInt64(&si.ActiveStreams, -1)
 			seqno := int32(0)
 			for withPayload {
 				var part PayloadPart
@@ -779,21 +890,28 @@ func storageBagFromDomain(domain *dns.Domain) []byte {
 }
 
 // startBag starts a TON Storage bag and returns its bagInfo actor.
-func (t *Transport) startBag(id []byte, host string) (*bagInfo, error) {
+func (t *Transport) startBag(ctx context.Context, id []byte, host string) (*bagInfo, error) {
 	log.Info().Str("bag_id", hex.EncodeToString(id)).Str("host", host).Msg("searching for bag id")
 
 	torrent := storage.NewTorrent("", t.store, t.storageConnector)
 	torrent.BagID = id
 
-	_ = t.store.SetTorrent(torrent)
+	if err := t.store.SetTorrent(torrent); err != nil {
+		return nil, fmt.Errorf("failed to register storage bag %s, err: %w", host, err)
+	}
 
 	if err := torrent.Start(true, false, false); err != nil {
+		t.store.RemoveTorrent(torrent)
 		return nil, fmt.Errorf("failed to start bag %s, err: %w", host, err)
 	}
 	log.Info().Str("bag_id", hex.EncodeToString(id)).Str("host", host).Msg("starting for bag id")
 
-	downloader, err := t.storageConnector.CreateDownloader(t.globalCtx, torrent)
+	downloader, stop, err := createPersistentDownloader(ctx, t.globalCtx, func(downloaderCtx context.Context) (storage.TorrentDownloader, error) {
+		return t.storageConnector.CreateDownloader(downloaderCtx, torrent)
+	})
 	if err != nil {
+		torrent.Stop()
+		t.store.RemoveTorrent(torrent)
 		return nil, fmt.Errorf("failed to create downloader for storage bag of %s, err: %w", host, err)
 	}
 
@@ -801,6 +919,7 @@ func (t *Transport) startBag(id []byte, host string) (*bagInfo, error) {
 	return &bagInfo{
 		torrent:    torrent,
 		downloader: downloader,
+		stop:       stop,
 	}, nil
 }
 
@@ -871,7 +990,7 @@ func (t *Transport) resolve(ctx context.Context, host string) (_ any, err error)
 	}
 
 	if inStorage {
-		return t.startBag(id, host)
+		return t.startBag(ctx, id, host)
 	}
 
 	log.Info().Str("host", host).Str("node", hex.EncodeToString(id)).Msg("resolving ton site address")
@@ -883,7 +1002,7 @@ func (t *Transport) resolve(ctx context.Context, host string) (_ any, err error)
 	if err != nil {
 		if bag := storageBagFromDomain(domain); bag != nil {
 			log.Warn().Str("host", host).Err(err).Msg("ADNL site not found in DHT, falling back to TON Storage record")
-			return t.startBag(bag, host)
+			return t.startBag(ctx, bag, host)
 		}
 		return nil, fmt.Errorf("failed to find address of %s (%s) in DHT, err: %w", host, hex.EncodeToString(id), err)
 	}
@@ -891,7 +1010,7 @@ func (t *Transport) resolve(ctx context.Context, host string) (_ any, err error)
 	if len(addresses.Addresses) == 0 {
 		if bag := storageBagFromDomain(domain); bag != nil {
 			log.Warn().Str("host", host).Msg("ADNL site has no addresses in DHT, falling back to TON Storage record")
-			return t.startBag(bag, host)
+			return t.startBag(ctx, bag, host)
 		}
 		return nil, fmt.Errorf("failed to find address of %s (%s) in DHT,no addresses in record", host, hex.EncodeToString(id))
 	}
