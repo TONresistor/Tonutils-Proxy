@@ -384,8 +384,14 @@ func (t *Transport) RoundTrip(request *http.Request) (_ *http.Response, err erro
 	for attempt := 0; attempt <= _RoundTripMaxRetries; attempt++ {
 		if attempt > 0 {
 			log.Info().Int("attempt", attempt+1).Str("host", host).Msg("retrying connection")
-			// Force re-resolve on retry.
+			// Force re-resolve on retry. Dropping the reference is not enough:
+			// the gateway caches ADNL peers by their public key, so an unclosed
+			// client is handed straight back on reconnect and a wedged peer
+			// survives every retry. Close it so the gateway evicts it.
 			site.mx.Lock()
+			if act, ok := site.Actor.(*rldpInfo); ok && act.ActiveClient != nil {
+				act.destroyClient(act.ActiveClient)
+			}
 			site.Actor = nil
 			site.mx.Unlock()
 		}
