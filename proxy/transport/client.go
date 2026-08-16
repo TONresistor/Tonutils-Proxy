@@ -383,7 +383,7 @@ func (t *Transport) RoundTrip(request *http.Request) (_ *http.Response, err erro
 
 	for attempt := 0; attempt <= _RoundTripMaxRetries; attempt++ {
 		if attempt > 0 {
-			log.Info().Int("attempt", attempt+1).Str("host", host).Msg("retrying connection")
+			log.Info().Int("attempt", attempt+1).Str("host", host).Err(err).Msg("retrying connection")
 			// Force re-resolve on retry.
 			site.mx.Lock()
 			site.Actor = nil
@@ -412,7 +412,11 @@ func (t *Transport) RoundTrip(request *http.Request) (_ *http.Response, err erro
 		site.mx.Unlock()
 
 		if rldpClient != nil {
-			resp, err := t.doRldpHttp(rldpClient, host, request)
+			// Assign to the named `err`: a short declaration here would shadow it
+			// and the final error below would wrap a nil, hiding every RLDP
+			// failure behind "%!w(<nil>)".
+			var resp *http.Response
+			resp, err = t.doRldpHttp(rldpClient, host, request)
 			if err != nil {
 				// Invalidate the cached RLDP connection so the next request
 				// reconnects instead of reusing a dead connection.
@@ -427,7 +431,8 @@ func (t *Transport) RoundTrip(request *http.Request) (_ *http.Response, err erro
 			return resp, nil
 		}
 
-		resp, err := t.doTorrent(torrent, request, site)
+		var resp *http.Response
+		resp, err = t.doTorrent(torrent, request, site)
 		if err != nil {
 			continue
 		}
@@ -435,6 +440,9 @@ func (t *Transport) RoundTrip(request *http.Request) (_ *http.Response, err erro
 		return resp, nil
 	}
 
+	if err == nil {
+		err = fmt.Errorf("no response from site")
+	}
 	return nil, fmt.Errorf("failed to connect to site after %d attempts: %w", _RoundTripMaxRetries+1, err)
 }
 
