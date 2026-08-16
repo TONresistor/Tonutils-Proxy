@@ -29,8 +29,8 @@ const _ChunkSize = 1 << 17
 const _RLDPMaxAnswerSize = 2*_ChunkSize + 1024
 
 const _DHTFindTimeout = 10 * time.Second
-const _RLDPConnectTimeout = 8 * time.Second
 const _RoundTripMaxRetries = 2
+const _RLDPContinuationDelay = 5 * time.Millisecond
 
 // blockedResponseHeaders prevents malicious TON sites from injecting
 // dangerous headers into the HTTP response sent to the user's browser.
@@ -87,8 +87,75 @@ type ADNL interface {
 }
 
 type bagInfo struct {
+	key        string
 	torrent    *storage.Torrent
 	downloader storage.TorrentDownloader
+	stop       context.CancelFunc
+	mx         sync.Mutex
+	references int64
+	lastUsed   int64
+	invalid    bool
+	closeOnce  sync.Once
+}
+
+func (b *bagInfo) close() {
+	b.closeOnce.Do(func() {
+		if b.stop != nil {
+			b.stop()
+		}
+		if b.downloader != nil {
+			b.downloader.Close()
+		}
+		if b.torrent != nil {
+			b.torrent.Stop()
+		}
+	})
+}
+
+type downloaderResult struct {
+	downloader storage.TorrentDownloader
+	err        error
+}
+
+type bagLoad struct {
+	done chan struct{}
+}
+
+func createPersistentDownloader(requestCtx, globalCtx context.Context, create func(context.Context) (storage.TorrentDownloader, error)) (storage.TorrentDownloader, context.CancelFunc, error) {
+	downloaderCtx, stop := context.WithCancel(globalCtx)
+	result := make(chan downloaderResult)
+	abandoned := make(chan struct{})
+	go func() {
+		downloader, err := create(downloaderCtx)
+		select {
+		case result <- downloaderResult{downloader: downloader, err: err}:
+		case <-abandoned:
+			if downloader != nil {
+				downloader.Close()
+			}
+		}
+	}()
+
+	select {
+	case res := <-result:
+		if res.err != nil {
+			stop()
+			return nil, nil, res.err
+		}
+		if res.downloader == nil {
+			stop()
+			return nil, nil, errors.New("storage downloader is nil")
+		}
+		return res.downloader, stop, nil
+	case <-requestCtx.Done():
+		close(abandoned)
+		stop()
+		return nil, nil, requestCtx.Err()
+	case <-globalCtx.Done():
+		close(abandoned)
+		stop()
+		return nil, nil, globalCtx.Err()
+	}
 }
 
 var newRLDP = func(a ADNL) RLDP {
@@ -100,11 +167,16 @@ type siteInfo struct {
 
 	LastUsed    int64
 	LastSuccess int64
+	inFlight    int64
 	mx          sync.RWMutex
 }
 
 type rldpInfo struct {
+	mx sync.Mutex
+
 	ActiveClient RLDP
+	LastUsed     int64
+	references   int64
 
 	ID   ed25519.PublicKey
 	Addr string
@@ -118,7 +190,12 @@ type Transport struct {
 	store            *VirtualStorage
 	gate             *adnl.Gateway
 
-	activeSites map[string]*siteInfo
+	activeSites   map[string]*siteInfo
+	rldpClients   map[string]*rldpInfo
+	connectRLDPFn func(key ed25519.PublicKey, addr string) (RLDP, error)
+	storageBags   map[string]*bagInfo
+	storageLoads  map[string]*bagLoad
+	createBagFn   func(ctx context.Context, id []byte, host string) (*bagInfo, error)
 
 	activeRequests map[string]*payloadStream
 	globalCtx      context.Context
@@ -136,6 +213,9 @@ func NewTransport(gate *adnl.Gateway, dht DHT, resolver Resolver, pool *liteclie
 		store:            store,
 		activeRequests:   map[string]*payloadStream{},
 		activeSites:      map[string]*siteInfo{},
+		rldpClients:      map[string]*rldpInfo{},
+		storageBags:      map[string]*bagInfo{},
+		storageLoads:     map[string]*bagLoad{},
 	}
 	t.globalCtx, t.stop = context.WithCancel(context.Background())
 	go t.cleaner()
@@ -146,95 +226,444 @@ func (t *Transport) Stop() {
 	t.stop()
 }
 
+func (t *Transport) acquireSite(host string) *siteInfo {
+	now := time.Now().Unix()
+	t.mx.Lock()
+	site := t.activeSites[host]
+	if site == nil {
+		site = &siteInfo{}
+		t.activeSites[host] = site
+	}
+	atomic.StoreInt64(&site.LastUsed, now)
+	atomic.AddInt64(&site.inFlight, 1)
+	t.mx.Unlock()
+	return site
+}
+
+func (t *Transport) releaseSite(site *siteInfo) {
+	atomic.StoreInt64(&site.LastUsed, time.Now().Unix())
+	atomic.AddInt64(&site.inFlight, -1)
+}
+
+func retainActor(actor any) {
+	if info, ok := actor.(*rldpInfo); ok && info != nil {
+		atomic.AddInt64(&info.references, 1)
+	}
+}
+
+func releaseActor(actor any) *bagInfo {
+	switch info := actor.(type) {
+	case *rldpInfo:
+		if info != nil {
+			atomic.AddInt64(&info.references, -1)
+		}
+	case *bagInfo:
+		if info != nil {
+			info.mx.Lock()
+			info.references--
+			closeBag := info.invalid && info.references == 0
+			info.mx.Unlock()
+			if closeBag {
+				return info
+			}
+		}
+	}
+	return nil
+}
+
+func swapActorLocked(site *siteInfo, next any) *bagInfo {
+	if site.Actor == next {
+		return nil
+	}
+	retainActor(next)
+	previous := site.Actor
+	site.Actor = next
+	return releaseActor(previous)
+}
+
+func swapRetainedBagLocked(site *siteInfo, next *bagInfo) *bagInfo {
+	if site.Actor == next {
+		return releaseActor(next)
+	}
+	previous := site.Actor
+	site.Actor = next
+	return releaseActor(previous)
+}
+
+func (t *Transport) closeBag(bag *bagInfo) {
+	if bag == nil {
+		return
+	}
+	bag.close()
+	if t.store != nil && bag.torrent != nil {
+		t.store.RemoveTorrent(bag.torrent)
+	}
+}
+
+func (t *Transport) invalidateBag(bag *bagInfo) {
+	if bag == nil {
+		return
+	}
+
+	t.mx.Lock()
+	bag.mx.Lock()
+	if t.storageBags[bag.key] == bag {
+		delete(t.storageBags, bag.key)
+	}
+	bag.invalid = true
+	closeBag := bag.references == 0
+	bag.mx.Unlock()
+	t.mx.Unlock()
+
+	if closeBag {
+		t.closeBag(bag)
+	}
+}
+
+func (t *Transport) clearActor(site *siteInfo, expected any) {
+	site.mx.Lock()
+	if site.Actor != expected {
+		site.mx.Unlock()
+		return
+	}
+	if _, isBag := expected.(*bagInfo); isBag && atomic.LoadInt64(&site.inFlight) > 1 {
+		site.mx.Unlock()
+		return
+	}
+	bag := swapActorLocked(site, nil)
+	site.mx.Unlock()
+	t.closeBag(bag)
+	if failedBag, ok := expected.(*bagInfo); ok {
+		t.invalidateBag(failedBag)
+	}
+}
+
+func (t *Transport) snapshotActiveSites() map[string]*siteInfo {
+	t.mx.RLock()
+	defer t.mx.RUnlock()
+
+	sites := make(map[string]*siteInfo, len(t.activeSites))
+	for host, info := range t.activeSites {
+		sites[host] = info
+	}
+	return sites
+}
+
 func (t *Transport) cleaner() {
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-t.globalCtx.Done():
 			return
-		case <-time.After(3 * time.Second):
+		case <-ticker.C:
 		}
-
-		sites := make(map[string]*siteInfo, len(t.activeSites))
-		t.mx.RLock()
-		for s, info := range t.activeSites {
-			sites[s] = info
-		}
-		t.mx.RUnlock()
 
 		now := time.Now().Unix()
-		for s, info := range sites {
-			if info.mx.TryLock() {
-				// stop bags that was not used for > 5 min
-				if atomic.LoadInt64(&info.LastUsed)+300 < now {
-					switch act := info.Actor.(type) {
-					case *bagInfo:
-						t.mx.Lock()
-						if t.activeSites[s] == info {
-							delete(t.activeSites, s)
-						}
-						t.mx.Unlock()
-						act.downloader.Close()
-						act.torrent.Stop()
+		t.cleanIdleSites(now)
+		t.cleanIdleStorageBags(now)
+		t.cleanIdleRLDPClients(now)
+	}
+}
 
-						log.Debug().Hex("bag_id", act.torrent.BagID).Msg("stopped unused bag")
-					}
-				}
-				info.mx.Unlock()
+func (t *Transport) cleanIdleSites(now int64) {
+	for host, site := range t.snapshotActiveSites() {
+		if atomic.LoadInt64(&site.inFlight) != 0 || atomic.LoadInt64(&site.LastUsed)+300 >= now {
+			continue
+		}
+
+		if !site.mx.TryLock() {
+			continue
+		}
+		t.mx.Lock()
+		remove := t.activeSites[host] == site && atomic.LoadInt64(&site.inFlight) == 0 && atomic.LoadInt64(&site.LastUsed)+300 < now
+		if remove {
+			delete(t.activeSites, host)
+		}
+		t.mx.Unlock()
+		var bag *bagInfo
+		if remove {
+			bag = swapActorLocked(site, nil)
+		}
+		site.mx.Unlock()
+
+		t.closeBag(bag)
+	}
+}
+
+func (t *Transport) cleanIdleStorageBags(now int64) {
+	var expired []*bagInfo
+
+	t.mx.Lock()
+	for key, bag := range t.storageBags {
+		bag.mx.Lock()
+		if !bag.invalid && bag.references == 0 && bag.lastUsed+300 < now {
+			bag.invalid = true
+			delete(t.storageBags, key)
+			expired = append(expired, bag)
+		}
+		bag.mx.Unlock()
+	}
+	t.mx.Unlock()
+
+	for _, bag := range expired {
+		t.closeBag(bag)
+	}
+}
+
+func (t *Transport) cleanIdleRLDPClients(now int64) {
+	t.mx.RLock()
+	clients := make(map[string]*rldpInfo, len(t.rldpClients))
+	for id, info := range t.rldpClients {
+		clients[id] = info
+	}
+	t.mx.RUnlock()
+
+	for id, info := range clients {
+		if !info.mx.TryLock() {
+			continue
+		}
+		if atomic.LoadInt64(&info.references) != 0 || atomic.LoadInt64(&info.LastUsed)+300 >= now {
+			info.mx.Unlock()
+			continue
+		}
+
+		t.mx.Lock()
+		remove := t.rldpClients[id] == info && atomic.LoadInt64(&info.references) == 0 && atomic.LoadInt64(&info.LastUsed)+300 < now
+		if remove {
+			delete(t.rldpClients, id)
+		}
+		t.mx.Unlock()
+		if !remove {
+			info.mx.Unlock()
+			continue
+		}
+
+		client := info.ActiveClient
+		info.ActiveClient = nil
+		info.mx.Unlock()
+		if client != nil {
+			client.Close()
+		}
+	}
+}
+
+func (t *Transport) connectRLDP(key ed25519.PublicKey, addr string) (RLDP, error) {
+	a, err := t.gate.RegisterClient(addr, key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to register ADNL peer %s: %w", addr, err)
+	}
+	r := newRLDP(a)
+	r.SetOnQuery(t.getRLDPQueryHandler(r))
+	return r, nil
+}
+
+func (t *Transport) getOrConnectRLDP(key ed25519.PublicKey, addr string) (*rldpInfo, error) {
+	id := hex.EncodeToString(key)
+	t.mx.Lock()
+	if t.rldpClients == nil {
+		t.rldpClients = map[string]*rldpInfo{}
+	}
+	info := t.rldpClients[id]
+	if info == nil {
+		info = &rldpInfo{ID: append(ed25519.PublicKey(nil), key...)}
+		t.rldpClients[id] = info
+	}
+	atomic.StoreInt64(&info.LastUsed, time.Now().Unix())
+	t.mx.Unlock()
+
+	info.mx.Lock()
+	defer info.mx.Unlock()
+	if info.ActiveClient != nil {
+		return info, nil
+	}
+
+	dial := t.connectRLDPFn
+	if dial == nil {
+		dial = t.connectRLDP
+	}
+	client, err := dial(key, addr)
+	if err != nil {
+		return nil, err
+	}
+	client.SetOnDisconnect(t.removeRLDP(info, client))
+	info.ActiveClient = client
+	info.Addr = addr
+	return info, nil
+}
+
+func (t *Transport) lastRLDPAddress(key ed25519.PublicKey) string {
+	id := hex.EncodeToString(key)
+	t.mx.RLock()
+	info := t.rldpClients[id]
+	t.mx.RUnlock()
+	if info == nil {
+		return ""
+	}
+
+	info.mx.Lock()
+	defer info.mx.Unlock()
+	return info.Addr
+}
+
+func orderedRLDPAddresses(addresses []string, lastUsed string) []string {
+	ordered := append([]string(nil), addresses...)
+	for i, candidate := range ordered {
+		if candidate != lastUsed || len(ordered) < 2 {
+			continue
+		}
+		next := i + 1
+		if next == len(ordered) {
+			next = 0
+		}
+		return append(append([]string(nil), ordered[next:]...), ordered[:next]...)
+	}
+	return ordered
+}
+
+func rldpAddresses(records []address.Address) []string {
+	addresses := make([]string, 0, len(records))
+	seen := make(map[string]struct{}, len(records))
+	for _, record := range records {
+		port := address.PortValue(record)
+		if address.IsZero(record) || port <= 0 || port > 65535 {
+			continue
+		}
+		candidate, err := address.DialString(record)
+		if err != nil {
+			continue
+		}
+		if _, ok := seen[candidate]; ok {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		addresses = append(addresses, candidate)
+	}
+	return addresses
+}
+
+func (t *Transport) removeRLDP(info *rldpInfo, rl RLDP) func() {
+	return func() {
+		info.mx.Lock()
+		if info.ActiveClient == rl {
+			info.ActiveClient = nil
+		}
+		info.mx.Unlock()
+	}
+}
+
+func (r *rldpInfo) destroyClient(rl RLDP) bool {
+	r.mx.Lock()
+	if r.ActiveClient != rl {
+		r.mx.Unlock()
+		return false
+	}
+	r.ActiveClient = nil
+	r.mx.Unlock()
+	rl.Close()
+	return true
+}
+
+func (t *Transport) createStorageBag(ctx context.Context, id []byte, host string) (*bagInfo, error) {
+	torrent := storage.NewTorrent("", t.store, t.storageConnector)
+	torrent.BagID = id
+
+	if err := t.store.SetTorrent(torrent); err != nil {
+		return nil, fmt.Errorf("failed to register storage bag %s, err: %w", host, err)
+	}
+	if err := torrent.Start(true, false, false); err != nil {
+		t.store.RemoveTorrent(torrent)
+		return nil, fmt.Errorf("failed to start bag %s, err: %w", host, err)
+	}
+
+	downloader, stop, err := createPersistentDownloader(ctx, t.globalCtx, func(downloaderCtx context.Context) (storage.TorrentDownloader, error) {
+		return t.storageConnector.CreateDownloader(downloaderCtx, torrent)
+	})
+	if err != nil {
+		torrent.Stop()
+		t.store.RemoveTorrent(torrent)
+		return nil, fmt.Errorf("failed to create downloader for storage bag of %s, err: %w", host, err)
+	}
+
+	return &bagInfo{
+		torrent:    torrent,
+		downloader: downloader,
+		stop:       stop,
+	}, nil
+}
+
+func (t *Transport) getOrCreateStorageBag(ctx context.Context, id []byte, host string) (*bagInfo, error) {
+	key := hex.EncodeToString(id)
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		select {
+		case <-t.globalCtx.Done():
+			return nil, t.globalCtx.Err()
+		default:
+		}
+
+		t.mx.Lock()
+		if t.storageBags == nil {
+			t.storageBags = map[string]*bagInfo{}
+		}
+		if t.storageLoads == nil {
+			t.storageLoads = map[string]*bagLoad{}
+		}
+		if bag := t.storageBags[key]; bag != nil {
+			bag.mx.Lock()
+			if !bag.invalid {
+				bag.references++
+				bag.lastUsed = time.Now().Unix()
+				bag.mx.Unlock()
+				t.mx.Unlock()
+				return bag, nil
+			}
+			bag.mx.Unlock()
+		}
+		if load := t.storageLoads[key]; load != nil {
+			done := load.done
+			t.mx.Unlock()
+			select {
+			case <-done:
+				continue
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-t.globalCtx.Done():
+				return nil, t.globalCtx.Err()
 			}
 		}
-	}
-}
 
-func (t *Transport) connectRLDP(key ed25519.PublicKey, addr, host string) (RLDP, error) {
-	type result struct {
-		r   RLDP
-		err error
-	}
-	ch := make(chan result, 1)
-	go func() {
-		a, err := t.gate.RegisterClient(addr, key)
+		load := &bagLoad{done: make(chan struct{})}
+		t.storageLoads[key] = load
+		t.mx.Unlock()
+
+		create := t.createBagFn
+		if create == nil {
+			create = t.createStorageBag
+		}
+		bag, err := create(ctx, id, host)
+		if err == nil && bag == nil {
+			err = errors.New("storage bag is nil")
+		}
+		if bag != nil {
+			bag.key = key
+			bag.lastUsed = time.Now().Unix()
+		}
+
+		t.mx.Lock()
+		if t.storageLoads[key] == load {
+			delete(t.storageLoads, key)
+			if err == nil {
+				t.storageBags[key] = bag
+			}
+			close(load.done)
+		}
+		t.mx.Unlock()
 		if err != nil {
-			ch <- result{nil, fmt.Errorf("failed to init adnl for rldp connection %s, err: %w", addr, err)}
-			return
+			return nil, err
 		}
-		r := newRLDP(a)
-		r.SetOnQuery(t.getRLDPQueryHandler(r))
-		r.SetOnDisconnect(t.removeRLDP(r, host))
-		ch <- result{r, nil}
-	}()
-
-	select {
-	case res := <-ch:
-		return res.r, res.err
-	case <-time.After(_RLDPConnectTimeout):
-		return nil, fmt.Errorf("ADNL handshake timeout after %s for %s", _RLDPConnectTimeout, addr)
-	}
-}
-
-func (t *Transport) removeRLDP(rl RLDP, host string) func() {
-	return func() {
-		t.mx.RLock()
-		r := t.activeSites[host]
-		t.mx.RUnlock()
-
-		if r == nil {
-			return
-		}
-
-		r.mx.Lock()
-		defer r.mx.Unlock()
-
-		if act, ok := r.Actor.(*rldpInfo); ok {
-			act.destroyClient(rl)
-		}
-	}
-}
-
-func (r *rldpInfo) destroyClient(rl RLDP) {
-	rl.Close()
-
-	if r.ActiveClient == rl {
-		r.ActiveClient = nil
 	}
 }
 
@@ -310,18 +739,44 @@ func handleGetPart(req GetNextPayloadPart, stream *payloadStream) (*PayloadPart,
 	}, nil
 }
 
-func (s *siteInfo) prepare(t *Transport, request *http.Request) error {
-	return s.prepareWithDepth(t, request, 0)
+type preparedSite struct {
+	rldp   *rldpInfo
+	client RLDP
+	bag    *bagInfo
 }
 
-func (s *siteInfo) prepareWithDepth(t *Transport, request *http.Request, depth int) (err error) {
-	if depth > 1 {
-		return fmt.Errorf("prepare recursion limit reached for %s", request.Host)
-	}
+type siteResponseBody struct {
+	io.ReadCloser
+	release func()
+}
 
+func (b *siteResponseBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if errors.Is(err, io.EOF) {
+		b.release()
+	}
+	return n, err
+}
+
+func (b *siteResponseBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.release()
+	return err
+}
+
+func holdSiteUntilResponseClose(response *http.Response, release func()) *http.Response {
+	if response.Body == nil {
+		release()
+		return response
+	}
+	response.Body = &siteResponseBody{ReadCloser: response.Body, release: release}
+	return response
+}
+
+func (t *Transport) prepareSite(site *siteInfo, request *http.Request) (preparedSite, error) {
 	select {
 	case <-t.globalCtx.Done():
-		return t.globalCtx.Err()
+		return preparedSite{}, t.globalCtx.Err()
 	default:
 	}
 
@@ -330,39 +785,101 @@ func (s *siteInfo) prepareWithDepth(t *Transport, request *http.Request, depth i
 		host = request.Host
 	}
 
-	if s.Actor == nil || atomic.LoadInt64(&s.LastSuccess)+90 < time.Now().Unix() {
-		s.Actor, err = t.resolve(request.Context(), host)
+	var retired *bagInfo
+	site.mx.Lock()
+	inFlight := atomic.LoadInt64(&site.inFlight)
+	shouldRefresh := atomic.LoadInt64(&site.LastSuccess)+90 < time.Now().Unix() && inFlight <= 1
+	if bag, ok := site.Actor.(*bagInfo); ok && inFlight <= 1 {
+		bag.mx.Lock()
+		shouldRefresh = shouldRefresh || bag.invalid
+		bag.mx.Unlock()
+	}
+	if site.Actor == nil || shouldRefresh {
+		next, err := t.resolve(request.Context(), host)
 		if err != nil {
-			return err
+			site.mx.Unlock()
+			return preparedSite{}, err
 		}
-		// update success after resolve to not re-resolve too soon
-		atomic.StoreInt64(&s.LastSuccess, time.Now().Unix())
-		atomic.StoreInt64(&s.LastUsed, time.Now().Unix())
+		if bag, ok := next.(*bagInfo); ok {
+			retired = swapRetainedBagLocked(site, bag)
+		} else {
+			retired = swapActorLocked(site, next)
+		}
+		now := time.Now().Unix()
+		atomic.StoreInt64(&site.LastSuccess, now)
+		atomic.StoreInt64(&site.LastUsed, now)
 	}
 
-	switch act := s.Actor.(type) {
+	var prepared preparedSite
+	switch actor := site.Actor.(type) {
 	case *bagInfo:
-		atomic.StoreInt64(&s.LastUsed, time.Now().Unix())
+		actor.mx.Lock()
+		actor.lastUsed = time.Now().Unix()
+		actor.mx.Unlock()
+		prepared.bag = actor
 	case *rldpInfo:
-		if act.ActiveClient != nil && atomic.LoadInt64(&s.LastUsed)+30 < time.Now().Unix() {
-			act.ActiveClient.GetADNL().(adnl.Peer).Reinit()
-			atomic.StoreInt64(&s.LastUsed, time.Now().Unix())
+		actor.mx.Lock()
+		client := actor.ActiveClient
+		addr := actor.Addr
+		lastUsed := atomic.LoadInt64(&actor.LastUsed)
+		actor.mx.Unlock()
+
+		if client != nil && lastUsed+30 < time.Now().Unix() {
+			if peer, ok := client.GetADNL().(adnl.Peer); ok {
+				peer.Reinit()
+			}
 		}
 
-		if act.ActiveClient == nil {
-			act.ActiveClient, err = t.connectRLDP(act.ID, act.Addr, host)
+		if client == nil {
+			connected, err := t.getOrConnectRLDP(actor.ID, addr)
 			if err != nil {
-				// resolve again
-				s.Actor = nil
-				return s.prepareWithDepth(t, request, depth+1)
+				swapActorLocked(site, nil)
+				site.mx.Unlock()
+				t.closeBag(retired)
+				return preparedSite{}, err
 			}
-			atomic.StoreInt64(&s.LastUsed, time.Now().Unix())
+			if connected != actor {
+				swapActorLocked(site, connected)
+				actor = connected
+			}
+			actor.mx.Lock()
+			client = actor.ActiveClient
+			actor.mx.Unlock()
 		}
+
+		if client == nil {
+			swapActorLocked(site, nil)
+			site.mx.Unlock()
+			t.closeBag(retired)
+			return preparedSite{}, fmt.Errorf("RLDP client is unavailable for %s", host)
+		}
+		now := time.Now().Unix()
+		atomic.StoreInt64(&site.LastUsed, now)
+		atomic.StoreInt64(&actor.LastUsed, now)
+		prepared.rldp = actor
+		prepared.client = client
+	default:
+		site.mx.Unlock()
+		t.closeBag(retired)
+		return preparedSite{}, fmt.Errorf("site actor is unavailable for %s", host)
 	}
-	return nil
+	site.mx.Unlock()
+	t.closeBag(retired)
+	return prepared, nil
+}
+
+func canRetryRequest(request *http.Request) bool {
+	if request.Body != nil && request.Body != http.NoBody {
+		return false
+	}
+	return request.Method == http.MethodGet || request.Method == http.MethodHead
 }
 
 func (t *Transport) RoundTrip(request *http.Request) (_ *http.Response, err error) {
+	if err := request.Context().Err(); err != nil {
+		return nil, err
+	}
+
 	// For multi-chain domains, the proxy sets URL.Host to the resolved .adnl
 	// address while keeping Host as the original domain (e.g. "tonnet.eth").
 	// Use URL.Host for routing/resolution when it differs from Host.
@@ -371,79 +888,73 @@ func (t *Transport) RoundTrip(request *http.Request) (_ *http.Response, err erro
 		host = request.Host
 	}
 
-	t.mx.Lock()
-	site := t.activeSites[host]
-	if site == nil {
-		site = &siteInfo{
-			LastUsed: time.Now().Unix(),
+	site := t.acquireSite(host)
+	releaseSite := sync.OnceFunc(func() { t.releaseSite(site) })
+	defer func() {
+		if err != nil {
+			releaseSite()
 		}
-		t.activeSites[host] = site
-	}
-	t.mx.Unlock()
+	}()
 
-	for attempt := 0; attempt <= _RoundTripMaxRetries; attempt++ {
+	maxAttempts := 1
+	if canRetryRequest(request) {
+		maxAttempts += _RoundTripMaxRetries
+	}
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
 			log.Info().Int("attempt", attempt+1).Str("host", host).Err(err).Msg("retrying connection")
-			// Force re-resolve on retry.
-			site.mx.Lock()
-			site.Actor = nil
-			site.mx.Unlock()
 		}
 
-		var rldpClient RLDP
-		var torrent *bagInfo
-
 		tm := time.Now()
-		site.mx.Lock()
-		err = site.prepare(t, request)
+		prepared, prepareErr := t.prepareSite(site, request)
+		err = prepareErr
 		log.Info().Str("host", host).Dur("took", time.Since(tm)).Msg("prepare took")
 
 		if err != nil {
-			site.mx.Unlock()
+			if requestErr := request.Context().Err(); requestErr != nil {
+				return nil, requestErr
+			}
 			continue
 		}
 
-		switch act := site.Actor.(type) {
-		case *rldpInfo:
-			rldpClient = act.ActiveClient
-		case *bagInfo:
-			torrent = act
-		}
-		site.mx.Unlock()
-
-		if rldpClient != nil {
-			// Assign to the named `err`: a short declaration here would shadow it
-			// and the final error below would wrap a nil, hiding every RLDP
-			// failure behind "%!w(<nil>)".
+		if prepared.client != nil {
 			var resp *http.Response
-			resp, err = t.doRldpHttp(rldpClient, host, request)
+			resp, err = t.doRldpHttp(prepared.client, host, request)
 			if err != nil {
-				// Invalidate the cached RLDP connection so the next request
-				// reconnects instead of reusing a dead connection.
-				site.mx.Lock()
-				if act, ok := site.Actor.(*rldpInfo); ok {
-					act.destroyClient(rldpClient)
+				if requestErr := request.Context().Err(); requestErr != nil {
+					return nil, requestErr
 				}
-				site.mx.Unlock()
+				if prepared.rldp.destroyClient(prepared.client) {
+					t.clearActor(site, prepared.rldp)
+				}
 				continue
 			}
 			atomic.StoreInt64(&site.LastSuccess, time.Now().Unix())
-			return resp, nil
+			return holdSiteUntilResponseClose(resp, releaseSite), nil
 		}
 
+		if prepared.bag == nil {
+			err = fmt.Errorf("site actor is unavailable for %s", host)
+			continue
+		}
 		var resp *http.Response
-		resp, err = t.doTorrent(torrent, request, site)
+		resp, err = t.doTorrent(prepared.bag, request, site)
 		if err != nil {
+			if requestErr := request.Context().Err(); requestErr != nil {
+				return nil, requestErr
+			}
+			t.clearActor(site, prepared.bag)
 			continue
 		}
 		atomic.StoreInt64(&site.LastSuccess, time.Now().Unix())
-		return resp, nil
+		return holdSiteUntilResponseClose(resp, releaseSite), nil
 	}
 
 	if err == nil {
 		err = fmt.Errorf("no response from site")
 	}
-	return nil, fmt.Errorf("failed to connect to site after %d attempts: %w", _RoundTripMaxRetries+1, err)
+	return nil, fmt.Errorf("failed to connect to site after %d attempts: %w", maxAttempts, err)
 }
 
 func (t *Transport) doTorrent(bag *bagInfo, request *http.Request, si *siteInfo) (*http.Response, error) {
@@ -453,16 +964,10 @@ func (t *Transport) doTorrent(bag *bagInfo, request *http.Request, si *siteInfo)
 		fileName = "index.html"
 	}
 
-	if request.Body != nil {
-		tmp := make([]byte, 4096)
-		for { // discard body
-			_, err := request.Body.Read(tmp)
-			if err != nil {
-				if err == io.EOF {
-					break
-				}
-				return nil, fmt.Errorf("failed to read request body: %w", err)
-			}
+	if request.Body != nil && request.Body != http.NoBody {
+		defer request.Body.Close()
+		if _, err := io.Copy(io.Discard, request.Body); err != nil {
+			return nil, fmt.Errorf("failed to read request body: %w", err)
 		}
 	}
 
@@ -580,16 +1085,49 @@ func (t *Transport) doTorrent(bag *bagInfo, request *http.Request, si *siteInfo)
 	return httpResp, nil
 }
 
-func (t *Transport) doRldpHttp(client RLDP, host string, request *http.Request) (*http.Response, error) {
-	qid := make([]byte, 32)
-	_, err := rand.Read(qid)
-	if err != nil {
-		return nil, err
-	}
+type requestPayload struct {
+	body      io.ReadCloser
+	stream    *dataStreamer
+	done      chan struct{}
+	closeBody sync.Once
+}
 
-	// Use the original Host header (e.g. "tonnet.eth") so the remote nginx
-	// can match its server_name. The host parameter is the .adnl routing
-	// address used for RLDP transport only.
+func newRequestPayload(body io.ReadCloser) *requestPayload {
+	payload := &requestPayload{
+		body:   body,
+		stream: newDataStreamer(),
+		done:   make(chan struct{}),
+	}
+	go payload.pump()
+	return payload
+}
+
+func (p *requestPayload) pump() {
+	defer close(p.done)
+	defer p.closeRequestBody()
+	if _, err := io.Copy(p.stream, p.body); err != nil {
+		_ = p.stream.Close()
+		return
+	}
+	p.stream.Finish()
+}
+
+func (p *requestPayload) closeRequestBody() {
+	p.closeBody.Do(func() {
+		_ = p.body.Close()
+	})
+}
+
+func (p *requestPayload) close() {
+	_ = p.stream.Close()
+	p.closeRequestBody()
+}
+
+func requestHasBody(request *http.Request) bool {
+	return request.Body != nil && request.Body != http.NoBody
+}
+
+func buildRLDPRequest(qid []byte, host string, request *http.Request) Request {
 	rldpHost := request.Host
 	if rldpHost == "" {
 		rldpHost = host
@@ -600,72 +1138,52 @@ func (t *Transport) doRldpHttp(client RLDP, host string, request *http.Request) 
 		Method:  request.Method,
 		URL:     request.URL.String(),
 		Version: "HTTP/1.1",
-		Headers: []Header{
-			{
-				Name:  "Host",
-				Value: rldpHost,
-			},
-		},
+		Headers: []Header{{Name: "Host", Value: rldpHost}},
 	}
 
-	if request.ContentLength > 0 {
-		req.Headers = append(req.Headers, Header{
-			Name:  "Content-Length",
-			Value: fmt.Sprint(request.ContentLength),
-		})
-	}
-
-	for k, v := range request.Header {
-		for _, hdr := range v {
-			req.Headers = append(req.Headers, Header{
-				Name:  k,
-				Value: hdr,
-			})
+	if requestHasBody(request) {
+		if request.ContentLength > 0 {
+			req.Headers = append(req.Headers, Header{Name: "Content-Length", Value: strconv.FormatInt(request.ContentLength, 10)})
+		} else {
+			req.Headers = append(req.Headers, Header{Name: "Transfer-Encoding", Value: "chunked"})
 		}
 	}
 
-	if request.Body != nil {
-		stream := newDataStreamer()
+	for name, values := range request.Header {
+		switch http.CanonicalHeaderKey(name) {
+		case "Host", "Content-Length", "Transfer-Encoding":
+			continue
+		}
+		for _, value := range values {
+			req.Headers = append(req.Headers, Header{Name: name, Value: value})
+		}
+	}
+	return req
+}
 
-		// chunked stream reader
-		go func() {
-			defer request.Body.Close()
+func (t *Transport) doRldpHttp(client RLDP, host string, request *http.Request) (*http.Response, error) {
+	qid := make([]byte, 32)
+	_, err := rand.Read(qid)
+	if err != nil {
+		return nil, err
+	}
 
-			var n int
-			for {
-				buf := make([]byte, 4096)
-				n, err = request.Body.Read(buf)
-				if err != nil {
-					if errors.Is(err, io.EOF) {
-						_, err = stream.Write(buf[:n])
-						if err == nil {
-							stream.Finish()
-							break
-						}
-					}
-					_ = stream.Close()
-					break
-				}
+	req := buildRLDPRequest(qid, host, request)
 
-				_, err = stream.Write(buf[:n])
-				if err != nil {
-					_ = stream.Close()
-					break
-				}
-			}
-		}()
-
+	if requestHasBody(request) {
+		payload := newRequestPayload(request.Body)
+		stream := &payloadStream{Data: payload.stream, ValidTill: time.Now().Add(15 * time.Second)}
+		requestID := hex.EncodeToString(qid)
 		t.mx.Lock()
-		t.activeRequests[hex.EncodeToString(qid)] = &payloadStream{
-			Data:      stream,
-			ValidTill: time.Now().Add(15 * time.Second),
-		}
+		t.activeRequests[requestID] = stream
 		t.mx.Unlock()
-
 		defer func() {
 			t.mx.Lock()
-			delete(t.activeRequests, hex.EncodeToString(qid))
+			if t.activeRequests[requestID] == stream {
+				delete(t.activeRequests, requestID)
+			}
 			t.mx.Unlock()
+			payload.close()
 		}()
 	}
 
@@ -694,8 +1212,8 @@ func (t *Transport) doRldpHttp(client RLDP, host string, request *http.Request) 
 		httpResp.Header.Add(header.Name, header.Value)
 	}
 
-	if ln, ok := request.Header["Content-Length"]; ok && len(ln) > 0 {
-		httpResp.ContentLength, err = strconv.ParseInt(ln[0], 10, 64)
+	if contentLength := httpResp.Header.Get("Content-Length"); contentLength != "" {
+		httpResp.ContentLength, err = strconv.ParseInt(contentLength, 10, 64)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse content length: %w", err)
 		}
@@ -712,35 +1230,9 @@ func (t *Transport) doRldpHttp(client RLDP, host string, request *http.Request) 
 		}
 
 		go func() {
-			seqno := int32(0)
-			for withPayload {
-				var part PayloadPart
-				err := client.DoQuery(request.Context(), _RLDPMaxAnswerSize*1000, GetNextPayloadPart{
-					ID:           qid,
-					Seqno:        seqno,
-					MaxChunkSize: _ChunkSize * 100,
-				}, &part)
-				if err != nil {
-					_ = dr.Close()
-					return
-				}
-
-				for _, tr := range part.Trailer {
-					httpResp.Trailer[tr.Name] = []string{tr.Value}
-				}
-
-				withPayload = !part.IsLast
-				_, err = dr.Write(part.Data)
-				if err != nil {
-					_ = dr.Close()
-					return
-				}
-
-				if part.IsLast {
-					dr.Finish()
-				}
-
-				seqno++
+			if err := fetchRLDPPayload(request.Context(), client, qid, httpResp, dr, _RLDPContinuationDelay); err != nil {
+				_ = dr.Close()
+				log.Warn().Err(err).Str("host", host).Msg("RLDP payload stream failed")
 			}
 		}()
 	} else {
@@ -748,6 +1240,41 @@ func (t *Transport) doRldpHttp(client RLDP, host string, request *http.Request) 
 	}
 
 	return httpResp, nil
+}
+
+func fetchRLDPPayload(ctx context.Context, client RLDP, qid []byte, httpResp *http.Response, dr *dataStreamer, continuationDelay time.Duration) error {
+	for seqno := int32(0); ; seqno++ {
+		if seqno > 0 && continuationDelay > 0 {
+			timer := time.NewTimer(continuationDelay)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			}
+		}
+
+		var part PayloadPart
+		if err := client.DoQuery(ctx, _RLDPMaxAnswerSize*1000, GetNextPayloadPart{
+			ID:           qid,
+			Seqno:        seqno,
+			MaxChunkSize: _ChunkSize * 100,
+		}, &part); err != nil {
+			return fmt.Errorf("failed to fetch payload continuation %d: %w", seqno, err)
+		}
+
+		for _, tr := range part.Trailer {
+			httpResp.Trailer[tr.Name] = []string{tr.Value}
+		}
+
+		if _, err := dr.Write(part.Data); err != nil {
+			return err
+		}
+		if part.IsLast {
+			dr.Finish()
+			return nil
+		}
+	}
 }
 
 func (t *Transport) resolve(ctx context.Context, host string) (_ any, err error) {
@@ -813,27 +1340,12 @@ func (t *Transport) resolve(ctx context.Context, host string) (_ any, err error)
 
 	if inStorage {
 		log.Info().Str("bag_id", hex.EncodeToString(id)).Str("host", host).Msg("searching for bag id")
-
-		torrent := storage.NewTorrent("", t.store, t.storageConnector)
-		torrent.BagID = id
-
-		_ = t.store.SetTorrent(torrent)
-
-		if err = torrent.Start(true, false, false); err != nil {
-			return nil, fmt.Errorf("failed to start bag %s, err: %w", host, err)
-		}
-		log.Info().Str("bag_id", hex.EncodeToString(id)).Str("host", host).Msg("starting for bag id")
-
-		downloader, err := t.storageConnector.CreateDownloader(t.globalCtx, torrent)
+		bag, err := t.getOrCreateStorageBag(ctx, id, host)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create downloader for storage bag of %s, err: %w", host, err)
+			return nil, err
 		}
-
 		log.Info().Str("bag_id", hex.EncodeToString(id)).Str("host", host).Msg("bag found")
-		return &bagInfo{
-			torrent:    torrent,
-			downloader: downloader,
-		}, nil
+		return bag, nil
 	}
 
 	log.Info().Str("host", host).Str("node", hex.EncodeToString(id)).Msg("resolving ton site address")
@@ -846,58 +1358,41 @@ func (t *Transport) resolve(ctx context.Context, host string) (_ any, err error)
 		return nil, fmt.Errorf("failed to find address of %s (%s) in DHT, err: %w", host, hex.EncodeToString(id), err)
 	}
 
-	if len(addresses.Addresses) == 0 {
-		return nil, fmt.Errorf("failed to find address of %s (%s) in DHT,no addresses in record", host, hex.EncodeToString(id))
+	if addresses == nil || len(addresses.Addresses) == 0 {
+		return nil, fmt.Errorf("failed to find address of %s (%s) in DHT, no addresses in record", host, hex.EncodeToString(id))
 	}
 
 	log.Info().Str("host", host).Str("node", hex.EncodeToString(id)).Msg("server address resolved")
 
-	// Connect to addresses in parallel, first success wins.
-	type connResult struct {
-		client RLDP
-		addr   string
-		err    error
-	}
-	addrList := addresses.Addresses
-	connCh := make(chan connResult, len(addrList))
-
-	for _, v := range addrList {
-		addr := fmt.Sprintf("%s:%d", address.IPValue(v).String(), address.PortValue(v))
-		log.Info().Str("host", host).Str("node", hex.EncodeToString(id)).Str("address", addr).Msg("connecting to ton site")
-		go func(addr string) {
-			c, err := t.connectRLDP(pubKey, addr, host)
-			connCh <- connResult{c, addr, err}
-		}(addr)
+	candidates := orderedRLDPAddresses(rldpAddresses(addresses.Addresses), t.lastRLDPAddress(pubKey))
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("failed to connect to host %s, DHT record has no valid addresses", host)
 	}
 
-	var client RLDP
+	var info *rldpInfo
 	var addr string
 	var triedAddresses []string
-	remaining := len(addrList)
-	for remaining > 0 {
-		res := <-connCh
-		remaining--
-		if res.err != nil {
-			log.Error().Err(res.err).Msg("RLDP connection failed")
-			log.Debug().Str("host", host).Str("node", hex.EncodeToString(id)).Str("address", res.addr).Msg("RLDP connection failed details")
-			triedAddresses = append(triedAddresses, res.addr)
+	for _, candidateAddr := range candidates {
+		log.Info().Str("host", host).Str("node", hex.EncodeToString(id)).Str("address", candidateAddr).Msg("registering TON site peer")
+		candidate, connectErr := t.getOrConnectRLDP(pubKey, candidateAddr)
+		if connectErr != nil {
+			log.Error().Err(connectErr).Msg("RLDP connection failed")
+			log.Debug().Str("host", host).Str("node", hex.EncodeToString(id)).Str("address", candidateAddr).Msg("RLDP connection failed details")
+			triedAddresses = append(triedAddresses, candidateAddr)
+			err = connectErr
 			continue
 		}
-		client = res.client
-		addr = res.addr
+		info = candidate
+		info.mx.Lock()
+		addr = info.Addr
+		info.mx.Unlock()
 		break
 	}
-	if client == nil {
+	if info == nil {
 		return nil, fmt.Errorf("failed to connect to rldp servers %s of host %s, err: %w", triedAddresses, host, err)
 	}
 
-	log.Info().Str("host", host).Str("node", hex.EncodeToString(id)).Str("address", addr).Msg("connected to server")
-
-	info := &rldpInfo{
-		ActiveClient: client,
-		ID:           pubKey,
-		Addr:         addr,
-	}
+	log.Info().Str("host", host).Str("node", hex.EncodeToString(id)).Str("address", addr).Msg("RLDP peer registered")
 	return info, nil
 }
 
