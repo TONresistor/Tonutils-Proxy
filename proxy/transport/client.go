@@ -10,6 +10,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/xssnick/tonutils-go/adnl"
 	"github.com/xssnick/tonutils-go/adnl/address"
+	"github.com/xssnick/tonutils-go/adnl/quic"
 	"github.com/xssnick/tonutils-go/adnl/rldp"
 	"github.com/xssnick/tonutils-go/liteclient"
 	"github.com/xssnick/tonutils-go/tl"
@@ -178,8 +179,9 @@ type rldpInfo struct {
 	LastUsed     int64
 	references   int64
 
-	ID   ed25519.PublicKey
-	Addr string
+	ID       ed25519.PublicKey
+	Addr     string
+	QuicAddr string
 }
 
 type Transport struct {
@@ -189,6 +191,7 @@ type Transport struct {
 	storageConnector storage.NetConnector
 	store            *VirtualStorage
 	gate             *adnl.Gateway
+	quicGate         *quic.Gateway
 
 	activeSites   map[string]*siteInfo
 	rldpClients   map[string]*rldpInfo
@@ -224,6 +227,9 @@ func NewTransport(gate *adnl.Gateway, dht DHT, resolver Resolver, pool *liteclie
 
 func (t *Transport) Stop() {
 	t.stop()
+	if t.quicGate != nil {
+		_ = t.quicGate.Close()
+	}
 }
 
 func (t *Transport) acquireSite(host string) *siteInfo {
@@ -448,17 +454,60 @@ func (t *Transport) cleanIdleRLDPClients(now int64) {
 	}
 }
 
-func (t *Transport) connectRLDP(key ed25519.PublicKey, addr string) (RLDP, error) {
+// EnableQUIC must be called before the transport serves requests.
+func (t *Transport) EnableQUIC(key ed25519.PrivateKey) error {
+	gate, err := quic.NewGateway(key)
+	if err != nil {
+		return err
+	}
+	t.quicGate = gate
+	return nil
+}
+
+func (t *Transport) connectHTTP(key ed25519.PublicKey, addr, quicAddr string) (RLDP, error) {
 	a, err := t.gate.RegisterClient(addr, key)
 	if err != nil {
 		return nil, fmt.Errorf("failed to register ADNL peer %s: %w", addr, err)
 	}
-	r := newRLDP(a)
+	useRLDP1 := false
+	if t.quicGate != nil {
+		ctx, cancel := context.WithTimeout(t.globalCtx, 3*time.Second)
+		var caps Capabilities
+		err = a.Query(ctx, GetCapabilities{Capabilities: CapabilityRLDP2 | CapabilityQUIC}, &caps)
+		cancel()
+		// Older peers may not implement capability negotiation; retain RLDP2 for them.
+		if err == nil && caps.Value&CapabilityQUIC != 0 {
+			ctx, cancel = context.WithTimeout(t.globalCtx, 10*time.Second)
+			peer, dialErr := t.quicGate.DialDefault(ctx, key, quicAddr)
+			cancel()
+			if dialErr != nil {
+				a.Close()
+				return nil, fmt.Errorf("failed to connect QUIC peer: %w", dialErr)
+			}
+			a.Close()
+			client := &quicClient{peer: peer}
+			client.SetOnQuery(t.getRLDPQueryHandler(client))
+			log.Debug().Str("address", quicAddr).Msg("Selected HTTP transport: QUIC")
+			return client, nil
+		}
+		// Legacy HTTP peers advertise zero capabilities and use RLDP1.
+		useRLDP1 = err == nil && caps.Value&CapabilityRLDP2 == 0
+	}
+	var r RLDP
+	if useRLDP1 {
+		r = rldp.NewClient(a)
+	} else {
+		r = newRLDP(a)
+	}
 	r.SetOnQuery(t.getRLDPQueryHandler(r))
 	return r, nil
 }
 
 func (t *Transport) getOrConnectRLDP(key ed25519.PublicKey, addr string) (*rldpInfo, error) {
+	return t.getOrConnectHTTP(key, addr, "")
+}
+
+func (t *Transport) getOrConnectHTTP(key ed25519.PublicKey, addr, quicAddr string) (*rldpInfo, error) {
 	id := hex.EncodeToString(key)
 	t.mx.Lock()
 	if t.rldpClients == nil {
@@ -478,9 +527,14 @@ func (t *Transport) getOrConnectRLDP(key ed25519.PublicKey, addr string) (*rldpI
 		return info, nil
 	}
 
+	if quicAddr != "" {
+		info.QuicAddr = quicAddr
+	}
 	dial := t.connectRLDPFn
 	if dial == nil {
-		dial = t.connectRLDP
+		dial = func(key ed25519.PublicKey, addr string) (RLDP, error) {
+			return t.connectHTTP(key, addr, info.QuicAddr)
+		}
 	}
 	client, err := dial(key, addr)
 	if err != nil {
@@ -1243,6 +1297,12 @@ func (t *Transport) doRldpHttp(client RLDP, host string, request *http.Request) 
 }
 
 func fetchRLDPPayload(ctx context.Context, client RLDP, qid []byte, httpResp *http.Response, dr *dataStreamer, continuationDelay time.Duration) error {
+	chunkSize := int32(_ChunkSize * 100)
+	maxAnswerSize := uint64(_RLDPMaxAnswerSize * 1000)
+	if _, ok := client.(*quicClient); ok {
+		chunkSize = _ChunkSize
+		maxAnswerSize = _RLDPMaxAnswerSize
+	}
 	for seqno := int32(0); ; seqno++ {
 		if seqno > 0 && continuationDelay > 0 {
 			timer := time.NewTimer(continuationDelay)
@@ -1255,10 +1315,10 @@ func fetchRLDPPayload(ctx context.Context, client RLDP, qid []byte, httpResp *ht
 		}
 
 		var part PayloadPart
-		if err := client.DoQuery(ctx, _RLDPMaxAnswerSize*1000, GetNextPayloadPart{
+		if err := client.DoQuery(ctx, maxAnswerSize, GetNextPayloadPart{
 			ID:           qid,
 			Seqno:        seqno,
-			MaxChunkSize: _ChunkSize * 100,
+			MaxChunkSize: chunkSize,
 		}, &part); err != nil {
 			return fmt.Errorf("failed to fetch payload continuation %d: %w", seqno, err)
 		}
@@ -1369,12 +1429,20 @@ func (t *Transport) resolve(ctx context.Context, host string) (_ any, err error)
 		return nil, fmt.Errorf("failed to connect to host %s, DHT record has no valid addresses", host)
 	}
 
+	var quicAddr string
+	if t.quicGate != nil {
+		endpoint, endpointErr := quic.PeerEndpoint(addresses.Addresses)
+		if endpointErr != nil {
+			return nil, endpointErr
+		}
+		quicAddr = endpoint.String()
+	}
 	var info *rldpInfo
 	var addr string
 	var triedAddresses []string
 	for _, candidateAddr := range candidates {
 		log.Info().Str("host", host).Str("node", hex.EncodeToString(id)).Str("address", candidateAddr).Msg("registering TON site peer")
-		candidate, connectErr := t.getOrConnectRLDP(pubKey, candidateAddr)
+		candidate, connectErr := t.getOrConnectHTTP(pubKey, candidateAddr, quicAddr)
 		if connectErr != nil {
 			log.Error().Err(connectErr).Msg("RLDP connection failed")
 			log.Debug().Str("host", host).Str("node", hex.EncodeToString(id)).Str("address", candidateAddr).Msg("RLDP connection failed details")

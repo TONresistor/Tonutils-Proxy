@@ -83,6 +83,7 @@ require (
 	github.com/tklauser/numcpus v0.6.1 // indirect
 	github.com/wealdtech/go-multicodec v1.4.0 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
+	github.com/xssnick/quic-go-ton v0.0.0-20260707110703-14f3237f97b9 // indirect
 	github.com/xssnick/raptorq v1.5.1 // indirect
 	github.com/xssnick/ton-payment-network v1.3.1 // indirect
 	go.mongodb.org/mongo-driver/v2 v2.5.0 // indirect

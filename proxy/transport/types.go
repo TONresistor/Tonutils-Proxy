@@ -10,6 +10,11 @@ import (
 	"strings"
 )
 
+const (
+	CapabilityRLDP2 int64 = 1
+	CapabilityQUIC  int64 = 2
+)
+
 func init() {
 	tl.Register(Request{}, "http.request id:int256 method:string url:string http_version:string headers:(vector http.header) = http.Response")
 	tl.Register(Response{}, "http.response http_version:string status_code:int reason:string headers:(vector http.header) no_payload:Bool = http.Response")

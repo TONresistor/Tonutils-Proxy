@@ -80,7 +80,6 @@ func delHopHeaders(header http.Header) {
 	}
 }
 
-
 type proxy struct {
 	version       string
 	blockHttp     bool
@@ -509,6 +508,10 @@ func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.
 	})
 
 	t := transport.NewTransport(gateProxy, dhtClient, dnsClient, connPool, conn, store)
+	if err = t.EnableQUIC(proxyAdnlKey); err != nil {
+		t.Stop()
+		return fmt.Errorf("failed to init QUIC gateway: %w", err)
+	}
 	client = &http.Client{
 		Transport: t,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
