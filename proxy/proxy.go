@@ -95,8 +95,7 @@ func (p *proxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 	}
 
 	if req.Method == "CONNECT" {
-		log.Debug().Str("host", req.Host).Msg("CONNECT not supported")
-		http.Error(wr, "CONNECT not supported", http.StatusMethodNotAllowed)
+		p.serveConnect(wr, req)
 		return
 	}
 

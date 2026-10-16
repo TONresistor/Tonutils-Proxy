@@ -771,7 +771,7 @@ func handleGetPart(req GetNextPayloadPart, stream *payloadStream) (*PayloadPart,
 	}
 
 	offset := int64(req.Seqno) * int64(req.MaxChunkSize)
-	if offset != int64(stream.nextOffset) {
+	if (!stream.Tunnel && offset != int64(stream.nextOffset)) || (stream.Tunnel && req.Seqno != stream.nextSeqno) {
 		return nil, fmt.Errorf("failed to get part for stream %s, incorrect offset %d, should be %d", hex.EncodeToString(req.ID), offset, stream.nextOffset)
 	}
 
@@ -785,6 +785,7 @@ func handleGetPart(req GetNextPayloadPart, stream *payloadStream) (*PayloadPart,
 		last = true
 	}
 	stream.nextOffset += n
+	stream.nextSeqno++
 
 	return &PayloadPart{
 		Data:    data[:n],

@@ -8,6 +8,8 @@ import (
 
 type payloadStream struct {
 	nextOffset int
+	nextSeqno  int32
+	Tunnel     bool
 	Data       io.ReadCloser
 	ValidTill  time.Time
 
