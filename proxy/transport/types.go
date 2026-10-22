@@ -1,13 +1,19 @@
 package transport
 
 import (
+	"context"
 	"encoding/base32"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"github.com/sigurn/crc16"
+	"github.com/xssnick/tonutils-go/adnl/quic"
 	"github.com/xssnick/tonutils-go/tl"
+	"io"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 )
 
 func init() {
@@ -59,6 +65,114 @@ type GetCapabilities struct {
 
 type Capabilities struct {
 	Value int64 `tl:"long"`
+}
+
+type httpClient interface {
+	DoQuery(ctx context.Context, maxAnswerSize uint64, query, result tl.Serializable) error
+}
+
+type quicClient struct {
+	peer      *quic.Peer
+	failed    atomic.Bool
+	transport *Transport
+	owner     *quicOwner
+	inFlight  atomic.Int64
+}
+
+func (c *quicClient) DoQuery(ctx context.Context, maxAnswerSize uint64, query, result tl.Serializable) (err error) {
+	data, err := tl.Serialize(query, true)
+	if err != nil {
+		return fmt.Errorf("failed to serialize QUIC HTTP query: %w", err)
+	}
+	answer, err := c.peer.Query(ctx, data, int64(min(maxAnswerSize, uint64(quic.DefaultMaxObjectSize))))
+	if err != nil {
+		if errors.Is(err, quic.ErrPeerClosed) {
+			c.markFailed()
+		}
+		// As in C++, a request already sent over QUIC fails without replay on RLDP.
+		return fmt.Errorf("failed to query QUIC HTTP peer: %w", err)
+	}
+	return parseQUICHTTP(answer, result)
+}
+
+func (c *quicClient) markFailed() {
+	if c.failed.CompareAndSwap(false, true) {
+		c.transport.quicMx.Lock()
+		for _, wake := range c.owner.users {
+			notifyQUIC(wake)
+		}
+		c.transport.quicMx.Unlock()
+	}
+}
+
+// The root reference lasts through Body.Close/EOF. Upload and payload-fetch
+// goroutines retain their own references, so an early response cannot hide an
+// upload still in progress from the idle cleaner.
+type quicRequest struct {
+	client *quicClient
+	site   *siteInfo
+	refs   atomic.Int32
+}
+
+func (c *quicClient) beginRequest(site *siteInfo) *quicRequest {
+	c.inFlight.Add(1)
+	atomic.AddInt64(&site.quicInFlight, 1)
+	r := &quicRequest{client: c, site: site}
+	r.refs.Store(1)
+	r.touch()
+	return r
+}
+func (r *quicRequest) touch()  { atomic.StoreInt64(&r.site.QUICLastUsed, time.Now().UnixNano()) }
+func (r *quicRequest) retain() { r.refs.Add(1) }
+func (r *quicRequest) release() {
+	r.touch()
+	if r.refs.Add(-1) == 0 {
+		atomic.AddInt64(&r.site.quicInFlight, -1)
+		r.client.inFlight.Add(-1)
+		r.client.transport.closeUnusedQUIC(r.client)
+	}
+}
+func (r *quicRequest) DoQuery(ctx context.Context, max uint64, query, result tl.Serializable) error {
+	r.touch()
+	defer r.touch()
+	return r.client.DoQuery(ctx, max, query, result)
+}
+
+type quicResponseBody struct {
+	io.ReadCloser
+	flight *quicRequest
+	once   sync.Once
+}
+
+func (b *quicResponseBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	b.flight.touch()
+	if err != nil {
+		b.once.Do(b.flight.release)
+	}
+	return n, err
+}
+func (b *quicResponseBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.once.Do(b.flight.release)
+	return err
+}
+
+func parseQUICHTTP(data []byte, result tl.Serializable) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("failed to parse QUIC HTTP object: %v", recovered)
+		}
+	}()
+
+	rest, err := tl.Parse(result, data, true)
+	if err != nil {
+		return fmt.Errorf("failed to parse QUIC HTTP object: %w", err)
+	}
+	if len(rest) != 0 {
+		return fmt.Errorf("unexpected trailing QUIC HTTP data")
+	}
+	return nil
 }
 
 var crc16table = crc16.MakeTable(crc16.CRC16_XMODEM)

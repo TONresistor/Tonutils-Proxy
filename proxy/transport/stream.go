@@ -10,6 +10,7 @@ type payloadStream struct {
 	nextOffset int
 	Data       io.ReadCloser
 	ValidTill  time.Time
+	touch      func()
 
 	mx sync.Mutex
 }

@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -10,6 +11,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/xssnick/tonutils-go/adnl"
 	"github.com/xssnick/tonutils-go/adnl/address"
+	"github.com/xssnick/tonutils-go/adnl/quic"
 	"github.com/xssnick/tonutils-go/adnl/rldp"
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/ton/dns"
@@ -25,7 +27,13 @@ import (
 )
 
 const _ChunkSize = 1 << 17
+const _MaxPayloadChunkSize = _ChunkSize * 100
 const _RLDPMaxAnswerSize = 2*_ChunkSize + 1024
+const _RLDP2Capability int64 = 1
+const _QUICCapability int64 = 2
+const _QUICRetryDelay = 30 * time.Second
+const _TransportConnectTimeout = 3 * time.Second
+const _QUICIdleTimeout = 5 * time.Minute
 
 type DHT interface {
 	StoreAddress(ctx context.Context, addresses address.List, ttl time.Duration, ownerKey ed25519.PrivateKey) (int, []byte, error)
@@ -70,13 +78,25 @@ var newRLDP = func(a ADNL) RLDP {
 type siteInfo struct {
 	Actor any
 
-	LastUsed    int64
-	LastSuccess int64
-	mx          sync.RWMutex
+	LastUsed     int64
+	LastSuccess  int64
+	QUICLastUsed int64
+	quicInFlight int64
+	mx           sync.RWMutex
 }
 
 type rldpInfo struct {
-	ActiveClient RLDP
+	ActiveClient         RLDP
+	quicClient           *quicClient
+	quicUse              *quicReference
+	capabilities         int64
+	quicAddr             string
+	retryQUICAt          time.Time
+	capabilitiesReceived bool
+	inProgress           bool
+	quicCancel           context.CancelFunc
+	quicGeneration       uint64
+	quicWake             chan struct{}
 
 	ID   ed25519.PublicKey
 	Addr string
@@ -88,6 +108,11 @@ type Transport struct {
 	storageConnector storage.NetConnector
 	store            *VirtualStorage
 	gate             *adnl.Gateway
+	quicGate         *quic.Gateway
+	quicMx           sync.Mutex
+	quicPeers        map[string]*quicOwner
+	quicIdleTimeout  time.Duration
+	dialQUIC         func(context.Context, ed25519.PublicKey, string) (*quic.Peer, error)
 
 	activeSites map[string]*siteInfo
 
@@ -97,7 +122,7 @@ type Transport struct {
 	mx             sync.RWMutex
 }
 
-func NewTransport(gate *adnl.Gateway, dht DHT, resolver Resolver, storeConn storage.NetConnector, store *VirtualStorage) *Transport {
+func NewTransport(gate *adnl.Gateway, key ed25519.PrivateKey, dht DHT, resolver Resolver, storeConn storage.NetConnector, store *VirtualStorage, enableQUIC bool) *Transport {
 	t := &Transport{
 		gate:             gate,
 		dht:              dht,
@@ -106,14 +131,32 @@ func NewTransport(gate *adnl.Gateway, dht DHT, resolver Resolver, storeConn stor
 		store:            store,
 		activeRequests:   map[string]*payloadStream{},
 		activeSites:      map[string]*siteInfo{},
+		quicPeers:        make(map[string]*quicOwner),
+		quicIdleTimeout:  _QUICIdleTimeout,
 	}
 	t.globalCtx, t.stop = context.WithCancel(context.Background())
+	if enableQUIC {
+		quicGate, err := quic.NewGateway(key)
+		if err != nil {
+			log.Warn().Err(err).Msg("failed to init QUIC gateway, continuing with RLDP")
+		} else {
+			t.quicGate = quicGate
+			t.dialQUIC = quicGate.DialDefault
+			quicGate.SetConnectionHandler(func(peer *quic.Peer) error {
+				peer.SetQueryHandler(t.handleQUICQuery)
+				return nil
+			})
+		}
+	}
 	go t.cleaner()
 	return t
 }
 
 func (t *Transport) Stop() {
 	t.stop()
+	if t.quicGate != nil {
+		_ = t.quicGate.Close()
+	}
 }
 
 func (t *Transport) cleaner() {
@@ -124,33 +167,49 @@ func (t *Transport) cleaner() {
 		case <-time.After(3 * time.Second):
 		}
 
-		sites := make(map[string]*siteInfo, len(t.activeSites))
-		t.mx.RLock()
-		for s, info := range t.activeSites {
-			sites[s] = info
+		t.cleanIdle(time.Now())
+	}
+}
+
+func (t *Transport) cleanIdle(now time.Time) {
+	t.mx.RLock()
+	idle := t.quicIdleTimeout
+	sites := make(map[string]*siteInfo, len(t.activeSites))
+	for host, site := range t.activeSites {
+		sites[host] = site
+	}
+	t.mx.RUnlock()
+	for host, site := range sites {
+		if !site.mx.TryLock() {
+			continue
 		}
-		t.mx.RUnlock()
-
-		now := time.Now().Unix()
-		for s, info := range sites {
-			if info.mx.TryLock() {
-				// stop bags that was not used for > 5 min
-				if atomic.LoadInt64(&info.LastUsed)+300 < now {
-					switch act := info.Actor.(type) {
-					case *bagInfo:
-						t.mx.Lock()
-						if t.activeSites[s] == info {
-							delete(t.activeSites, s)
-						}
-						t.mx.Unlock()
-						act.downloader.Close()
-						act.torrent.Stop()
-
-						log.Debug().Hex("bag_id", act.torrent.BagID).Msg("stopped unused bag")
-					}
+		var retired *quicReference
+		switch act := site.Actor.(type) {
+		case *bagInfo:
+			if atomic.LoadInt64(&site.LastUsed)+300 < now.Unix() {
+				t.mx.Lock()
+				if t.activeSites[host] == site {
+					delete(t.activeSites, host)
 				}
-				info.mx.Unlock()
+				t.mx.Unlock()
+				act.downloader.Close()
+				act.torrent.Stop()
+				log.Debug().Hex("bag_id", act.torrent.BagID).Msg("stopped unused bag")
 			}
+		case *rldpInfo:
+			if atomic.LoadInt64(&site.quicInFlight) == 0 && now.Sub(time.Unix(0, atomic.LoadInt64(&site.QUICLastUsed))) > idle {
+				if act.inProgress || act.quicCancel != nil {
+					act.stopQUICWorker()
+				}
+				retired = act.quicUse
+				act.quicClient = nil
+				act.quicUse = nil
+				act.retryQUICAt = time.Time{}
+			}
+		}
+		site.mx.Unlock()
+		if retired != nil {
+			t.releaseQUIC(retired)
 		}
 	}
 }
@@ -160,12 +219,285 @@ func (t *Transport) connectRLDP(key ed25519.PublicKey, addr, host string) (RLDP,
 	if err != nil {
 		return nil, fmt.Errorf("failed to init adnl for rldp connection %s, err: %w", addr, err)
 	}
-
 	r := newRLDP(a)
 	r.SetOnQuery(t.getRLDPQueryHandler(r))
 	r.SetOnDisconnect(t.removeRLDP(r, host))
-
 	return r, nil
+}
+
+// Called under site.mx, after this request has selected its transport.
+func (t *Transport) startQUICWorker(site *siteInfo, info *rldpInfo) {
+	if t.quicGate == nil || info.inProgress || info.quicAddr == "" ||
+		(info.capabilitiesReceived && info.capabilities&_QUICCapability == 0) {
+		return
+	}
+	ctx, cancel := context.WithCancel(t.globalCtx)
+	// A canceled generation must not consume its successor's notifications.
+	info.quicWake = make(chan struct{}, 1)
+	wake := info.quicWake
+	if info.quicUse != nil {
+		t.quicMx.Lock()
+		info.quicUse.client.owner.users[info.quicUse] = wake
+		t.quicMx.Unlock()
+	}
+	info.quicCancel = cancel
+	info.inProgress = true
+	info.quicGeneration++
+	generation := info.quicGeneration
+	go func() { defer cancel(); t.watchQUIC(ctx, site, info, generation, wake) }()
+}
+
+func (r *rldpInfo) stopQUICWorker() {
+	if !r.inProgress && r.quicCancel == nil {
+		return
+	}
+	if r.quicCancel != nil {
+		r.quicCancel()
+		r.quicCancel = nil
+	}
+	r.quicGeneration++
+	r.inProgress = false
+}
+
+func notifyQUIC(wake chan struct{}) {
+	select {
+	case wake <- struct{}{}:
+	default:
+	}
+}
+
+func waitQUIC(ctx context.Context, wake <-chan struct{}, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-wake:
+		return true
+	case <-timer.C:
+		return true
+	}
+}
+
+func (t *Transport) watchQUIC(ctx context.Context, site *siteInfo, info *rldpInfo, generation uint64, wake chan struct{}) {
+	current := func() bool { return site.Actor == info && info.quicGeneration == generation && ctx.Err() == nil }
+	defer func() {
+		site.mx.Lock()
+		if info.quicGeneration == generation {
+			info.inProgress = false
+			info.quicCancel = nil
+		}
+		site.mx.Unlock()
+	}()
+	for {
+		site.mx.Lock()
+		if !current() {
+			site.mx.Unlock()
+			return
+		}
+		if info.quicClient != nil {
+			if !info.quicClient.failed.Load() {
+				site.mx.Unlock()
+				select {
+				case <-ctx.Done():
+					return
+				case <-wake:
+				}
+				continue
+			}
+			retired := info.quicUse
+			info.quicClient = nil
+			info.quicUse = nil
+			info.retryQUICAt = time.Now().Add(_QUICRetryDelay)
+			site.mx.Unlock()
+			t.releaseQUIC(retired)
+			continue
+		}
+		if delay := time.Until(info.retryQUICAt); delay > 0 {
+			site.mx.Unlock()
+			if !waitQUIC(ctx, wake, delay) {
+				return
+			}
+			continue
+		}
+		probe := !info.capabilitiesReceived
+		if !probe && info.capabilities&_QUICCapability == 0 {
+			site.mx.Unlock()
+			return
+		}
+		if info.ActiveClient == nil {
+			site.mx.Unlock()
+			if !waitQUIC(ctx, wake, _QUICRetryDelay) {
+				return
+			}
+			continue
+		}
+		peer := info.ActiveClient.GetADNL().(adnl.Peer)
+		info.retryQUICAt = time.Now().Add(_QUICRetryDelay)
+		site.mx.Unlock()
+
+		attempt, cancel := context.WithTimeout(ctx, _TransportConnectTimeout)
+		if probe {
+			var capabilities Capabilities
+			err := peer.Query(attempt, GetCapabilities{Capabilities: _RLDP2Capability | _QUICCapability}, &capabilities)
+			cancel()
+			site.mx.Lock()
+			if !current() {
+				site.mx.Unlock()
+				return
+			}
+			if err == nil {
+				info.capabilities = capabilities.Value
+				info.capabilitiesReceived = true
+				info.retryQUICAt = time.Time{}
+			}
+			site.mx.Unlock()
+			if err != nil {
+				log.Debug().Err(err).Msg("background capability probe failed, keeping RLDP2")
+			}
+			continue
+		}
+		use, err := t.acquireQUIC(attempt, info, wake)
+		cancel()
+		site.mx.Lock()
+		if !current() {
+			site.mx.Unlock()
+			if use != nil {
+				t.releaseQUIC(use)
+			}
+			return
+		}
+		if err != nil {
+			info.retryQUICAt = time.Now().Add(_QUICRetryDelay)
+			site.mx.Unlock()
+			log.Debug().Err(err).Str("address", info.quicAddr).Msg("failed to dial QUIC, using RLDP")
+			continue
+		}
+		info.quicClient = use.client
+		info.quicUse = use
+		info.retryQUICAt = time.Time{}
+		site.mx.Unlock()
+		log.Info().Str("address", info.quicAddr).Msg("using QUIC for ton site")
+	}
+}
+
+// Re-resolution preserves the capability cache only for the same peer endpoint.
+// Release the returned old client reference after releasing site.mx.
+func (t *Transport) reconcileQUIC(site *siteInfo, old *rldpInfo) *quicReference {
+	next, _ := site.Actor.(*rldpInfo)
+	if old == nil || old == next {
+		return nil
+	}
+	old.stopQUICWorker()
+	if next != nil && bytes.Equal(old.ID, next.ID) && old.Addr == next.Addr && old.quicAddr == next.quicAddr {
+		next.quicClient = old.quicClient
+		next.quicUse = old.quicUse
+		old.quicUse = nil
+		next.capabilities = old.capabilities
+		next.capabilitiesReceived = old.capabilitiesReceived
+		next.retryQUICAt = old.retryQUICAt
+		old.quicClient = nil
+		return nil
+	}
+	if old.quicClient != nil {
+		use := old.quicUse
+		old.quicClient = nil
+		old.quicUse = nil
+		return use
+	}
+	return nil
+}
+
+// quicOwner is guarded by Transport.quicMx. A busy owner is dialing or closing.
+// Keeping it registered until Close finishes prevents DialDefault reusing a peer
+// that another site has just released.
+type quicOwner struct {
+	key    string
+	client *quicClient
+	users  map[*quicReference]chan struct{}
+	busy   chan struct{}
+}
+
+// Each acquisition has its own reference, including overlapping worker
+// generations for one site. Releasing a canceled generation cannot detach its successor.
+type quicReference struct{ client *quicClient }
+
+func (t *Transport) acquireQUIC(ctx context.Context, info *rldpInfo, wake chan struct{}) (*quicReference, error) {
+	key := string(info.ID)
+	for {
+		t.quicMx.Lock()
+		owner := t.quicPeers[key]
+		if owner != nil && owner.busy != nil {
+			done := owner.busy
+			t.quicMx.Unlock()
+			select {
+			case <-done:
+				continue
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		if owner != nil {
+			if owner.client.failed.Load() {
+				t.quicMx.Unlock()
+				return nil, quic.ErrPeerClosed
+			}
+			use := &quicReference{client: owner.client}
+			owner.users[use] = wake
+			t.quicMx.Unlock()
+			return use, nil
+		}
+		owner = &quicOwner{key: key, users: make(map[*quicReference]chan struct{}), busy: make(chan struct{})}
+		t.quicPeers[key] = owner
+		t.quicMx.Unlock()
+
+		peer, err := t.dialQUIC(ctx, info.ID, info.quicAddr)
+		var client *quicClient
+		var use *quicReference
+		if err == nil {
+			client = &quicClient{peer: peer, transport: t, owner: owner}
+			peer.SetDisconnectHandler(func(*quic.Peer) { client.markFailed() })
+		}
+		t.quicMx.Lock()
+		if err != nil {
+			delete(t.quicPeers, key)
+		} else {
+			owner.client = client
+			use = &quicReference{client: client}
+			owner.users[use] = wake
+		}
+		close(owner.busy)
+		owner.busy = nil
+		t.quicMx.Unlock()
+		return use, err
+	}
+}
+
+func (t *Transport) releaseQUIC(use *quicReference) {
+	client := use.client
+	t.quicMx.Lock()
+	delete(client.owner.users, use)
+	t.quicMx.Unlock()
+	t.closeUnusedQUIC(client)
+}
+
+func (t *Transport) closeUnusedQUIC(client *quicClient) {
+	t.quicMx.Lock()
+	owner := client.owner
+	if t.quicPeers[owner.key] != owner || len(owner.users) != 0 || client.inFlight.Load() != 0 || owner.busy != nil {
+		t.quicMx.Unlock()
+		return
+	}
+	owner.busy = make(chan struct{})
+	t.quicMx.Unlock()
+	_ = client.peer.Close()
+	t.quicMx.Lock()
+	if t.quicPeers[owner.key] == owner {
+		delete(t.quicPeers, owner.key)
+	}
+	close(owner.busy)
+	owner.busy = nil
+	t.quicMx.Unlock()
 }
 
 func (t *Transport) removeRLDP(rl RLDP, host string) func() {
@@ -199,45 +531,65 @@ func (t *Transport) getRLDPQueryHandler(r RLDP) func(transferId []byte, query *r
 	return func(transferId []byte, query *rldp.Query) error {
 		switch req := query.Data.(type) {
 		case GetNextPayloadPart:
-			t.mx.RLock()
-			stream := t.activeRequests[hex.EncodeToString(req.ID)]
-			t.mx.RUnlock()
-
-			if stream == nil {
-				return fmt.Errorf("unknown request id %s", hex.EncodeToString(req.ID))
-			}
-
-			part, err := handleGetPart(req, stream)
-			if err != nil {
-				return fmt.Errorf("handle part err: %w", err)
-			}
-
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			err = r.SendAnswer(ctx, query.MaxAnswerSize, query.Timeout, query.ID, transferId, part)
-			cancel()
-			if err != nil {
-				return fmt.Errorf("failed to send answer: %w", err)
-			}
-
-			if part.IsLast {
-				t.mx.Lock()
-				delete(t.activeRequests, hex.EncodeToString(req.ID))
-				t.mx.Unlock()
-				_ = stream.Data.Close()
-			}
-
-			return nil
+			return t.handlePayloadQuery(req, func(part *PayloadPart) error {
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				defer cancel()
+				return r.SendAnswer(ctx, query.MaxAnswerSize, query.Timeout, query.ID, transferId, part)
+			})
 		}
 		return fmt.Errorf("unexpected query type %s", reflect.TypeOf(query.Data))
 	}
 }
 
+func (t *Transport) handlePayloadQuery(req GetNextPayloadPart, answer func(*PayloadPart) error) error {
+	t.mx.RLock()
+	stream := t.activeRequests[hex.EncodeToString(req.ID)]
+	t.mx.RUnlock()
+	if stream == nil {
+		return fmt.Errorf("unknown request id %s", hex.EncodeToString(req.ID))
+	}
+
+	part, err := handleGetPart(req, stream)
+	if err != nil {
+		return fmt.Errorf("handle part err: %w", err)
+	}
+	if stream.touch != nil {
+		stream.touch()
+	}
+	if err = answer(part); err != nil {
+		return fmt.Errorf("failed to send answer: %w", err)
+	}
+	if part.IsLast {
+		t.mx.Lock()
+		delete(t.activeRequests, hex.EncodeToString(req.ID))
+		t.mx.Unlock()
+		_ = stream.Data.Close()
+	}
+	return nil
+}
+
+func (t *Transport) handleQUICQuery(_ context.Context, data []byte) ([]byte, error) {
+	var req GetNextPayloadPart
+	if err := parseQUICHTTP(data, &req); err != nil {
+		return nil, err
+	}
+	var answer []byte
+	err := t.handlePayloadQuery(req, func(part *PayloadPart) (err error) {
+		answer, err = tl.Serialize(part, true)
+		return err
+	})
+	return answer, err
+}
+
 func handleGetPart(req GetNextPayloadPart, stream *payloadStream) (*PayloadPart, error) {
+	if req.Seqno < 0 || req.MaxChunkSize <= 0 || req.MaxChunkSize > _MaxPayloadChunkSize {
+		return nil, fmt.Errorf("invalid payload part bounds")
+	}
 	stream.mx.Lock()
 	defer stream.mx.Unlock()
 
-	offset := int(req.Seqno * req.MaxChunkSize)
-	if offset != stream.nextOffset {
+	offset := int64(req.Seqno) * int64(req.MaxChunkSize)
+	if offset != int64(stream.nextOffset) {
 		return nil, fmt.Errorf("failed to get part for stream %s, incorrect offset %d, should be %d", hex.EncodeToString(req.ID), offset, stream.nextOffset)
 	}
 
@@ -297,6 +649,7 @@ func (s *siteInfo) prepare(t *Transport, request *http.Request) (err error) {
 				s.Actor = nil
 				return s.prepare(t, request)
 			}
+			notifyQUIC(act.quicWake)
 			atomic.StoreInt64(&s.LastUsed, time.Now().Unix())
 		}
 	}
@@ -319,29 +672,51 @@ func (t *Transport) RoundTrip(request *http.Request) (_ *http.Response, err erro
 	}
 	t.mx.Unlock()
 
-	var rldpClient RLDP
+	var rldpClient httpClient
+	var flight *quicRequest
 	var torrent *bagInfo
 
 	tm := time.Now()
 	site.mx.Lock()
+	previousActor := site.Actor
+	previous, _ := previousActor.(*rldpInfo)
 	err = site.prepare(t, request)
 	log.Info().Str("host", host).Dur("took", time.Since(tm)).Msg("prepare took")
 
 	if err != nil {
+		// A failed lookup has not established a different peer endpoint.
+		site.Actor = previousActor
 		site.mx.Unlock()
 		return nil, fmt.Errorf("failed to connect to site: %w", err)
 	}
+	retired := t.reconcileQUIC(site, previous)
 
 	switch act := site.Actor.(type) {
 	case *rldpInfo:
 		rldpClient = act.ActiveClient
+		if act.quicClient != nil && !act.quicClient.failed.Load() {
+			flight = act.quicClient.beginRequest(site)
+			rldpClient = flight
+		}
+		t.startQUICWorker(site, act)
 	case *bagInfo:
 		torrent = act
 	}
+	atomic.StoreInt64(&site.QUICLastUsed, time.Now().UnixNano())
 	site.mx.Unlock()
+	if retired != nil {
+		t.releaseQUIC(retired)
+	}
 
 	if rldpClient != nil {
 		resp, err := t.doRldpHttp(rldpClient, host, request)
+		if flight != nil {
+			if err != nil {
+				flight.release()
+			} else {
+				resp.Body = &quicResponseBody{ReadCloser: resp.Body, flight: flight}
+			}
+		}
 		if err != nil {
 			return nil, fmt.Errorf("failed to request rldp-http site: %w", err)
 		}
@@ -494,7 +869,8 @@ func (t *Transport) doTorrent(bag *bagInfo, request *http.Request, si *siteInfo)
 	return httpResp, nil
 }
 
-func (t *Transport) doRldpHttp(client RLDP, host string, request *http.Request) (*http.Response, error) {
+func (t *Transport) doRldpHttp(client httpClient, host string, request *http.Request) (*http.Response, error) {
+	flight, _ := client.(*quicRequest)
 	qid := make([]byte, 32)
 	_, err := rand.Read(qid)
 	if err != nil {
@@ -533,14 +909,23 @@ func (t *Transport) doRldpHttp(client RLDP, host string, request *http.Request) 
 	if request.Body != nil {
 		stream := newDataStreamer()
 
+		// Uploads and response bodies retain the logical QUIC request independently.
+		if flight != nil {
+			flight.retain()
+		}
 		// chunked stream reader
 		go func() {
+			if flight != nil {
+				defer flight.release()
+			}
 			defer request.Body.Close()
 
-			var n int
 			for {
 				buf := make([]byte, 4096)
-				n, err = request.Body.Read(buf)
+				n, err := request.Body.Read(buf)
+				if flight != nil {
+					flight.touch()
+				}
 				if err != nil {
 					if errors.Is(err, io.EOF) {
 						_, err = stream.Write(buf[:n])
@@ -562,9 +947,14 @@ func (t *Transport) doRldpHttp(client RLDP, host string, request *http.Request) 
 		}()
 
 		t.mx.Lock()
+		var touch func()
+		if flight != nil {
+			touch = flight.touch
+		}
 		t.activeRequests[hex.EncodeToString(qid)] = &payloadStream{
 			Data:      stream,
 			ValidTill: time.Now().Add(15 * time.Second),
+			touch:     touch,
 		}
 		t.mx.Unlock()
 
@@ -572,6 +962,7 @@ func (t *Transport) doRldpHttp(client RLDP, host string, request *http.Request) 
 			t.mx.Lock()
 			delete(t.activeRequests, hex.EncodeToString(qid))
 			t.mx.Unlock()
+			_ = stream.Close()
 		}()
 	}
 
@@ -614,14 +1005,20 @@ func (t *Transport) doRldpHttp(client RLDP, host string, request *http.Request) 
 			dr.buf = make([]byte, 0, httpResp.ContentLength)
 		}
 
+		if flight != nil {
+			flight.retain()
+		}
 		go func() {
+			if flight != nil {
+				defer flight.release()
+			}
 			seqno := int32(0)
 			for withPayload {
 				var part PayloadPart
 				err := client.DoQuery(request.Context(), _RLDPMaxAnswerSize*1000, GetNextPayloadPart{
 					ID:           qid,
 					Seqno:        seqno,
-					MaxChunkSize: _ChunkSize * 100,
+					MaxChunkSize: _MaxPayloadChunkSize,
 				}, &part)
 				if err != nil {
 					_ = dr.Close()
@@ -786,6 +1183,21 @@ func (t *Transport) resolve(ctx context.Context, host string) (_ any, err error)
 		ActiveClient: client,
 		ID:           pubKey,
 		Addr:         addr,
+	}
+	// DHT decoding returns pointers; PeerEndpoint accepts the address values.
+	var endpoints []address.Address
+	for _, raw := range addresses.Addresses {
+		switch addr := raw.(type) {
+		case *address.UDP:
+			endpoints = append(endpoints, *addr)
+		case *address.UDP6:
+			endpoints = append(endpoints, *addr)
+		case *address.QUIC:
+			endpoints = append(endpoints, *addr)
+		}
+	}
+	if endpoint, endpointErr := quic.PeerEndpoint(endpoints); endpointErr == nil {
+		info.quicAddr = endpoint.String()
 	}
 	return info, nil
 }

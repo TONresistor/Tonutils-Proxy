@@ -416,7 +416,7 @@ func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.
 		State: "Starting HTTP server...",
 	})
 
-	t := transport.NewTransport(gateProxy, dhtClient, dnsClient, conn, store)
+	t := transport.NewTransport(gateProxy, proxyAdnlKey, dhtClient, dnsClient, conn, store, tunCfg == nil)
 	client = &http.Client{
 		Transport: t,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
