@@ -12,6 +12,8 @@ import (
 // Format contenthash ENSIP-7 : <MulticodecADNL uvarint><32 bytes ADNL>.
 const MulticodecADNL uint64 = 0xb69910
 
+const MulticodecTONStorage uint64 = 0xb79910
+
 // DecodeContenthash parses an ENSIP-7 contenthash into its multicodec and payload.
 func DecodeContenthash(ch []byte) (codec uint64, payload []byte, err error) {
 	if len(ch) == 0 {
@@ -49,4 +51,20 @@ func ExtractADNLFromContenthash(ch []byte) (hexAdnl string, ok bool, err error) 
 		return "", false, fmt.Errorf("invalid ADNL payload length: expected %d, got %d", ADNLAddressSize, len(payload))
 	}
 	return hex.EncodeToString(payload), true, nil
+}
+
+func ExtractSiteFromContenthash(ch []byte) (target SiteTarget, ok bool, err error) {
+	codec, payload, err := DecodeContenthash(ch)
+	if err != nil {
+		return SiteTarget{}, false, err
+	}
+	if codec != MulticodecADNL && codec != MulticodecTONStorage {
+		return SiteTarget{}, false, nil
+	}
+	if len(payload) != len(target.ID) {
+		return SiteTarget{}, false, fmt.Errorf("invalid site payload length: expected %d, got %d", len(target.ID), len(payload))
+	}
+	target.Codec = codec
+	copy(target.ID[:], payload)
+	return target, true, nil
 }

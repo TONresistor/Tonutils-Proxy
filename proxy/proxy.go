@@ -119,7 +119,7 @@ func (p *proxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 
 	req.Header.Set("X-Tonutils-Proxy", p.version)
 
-	// Resolve multi-chain domains (e.g. .eth) to .adnl before routing
+	// Resolve multi-chain domains (e.g. .eth) before routing.
 	host := req.Host
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
@@ -129,15 +129,15 @@ func (p *proxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 		return
 	}
 	if p.multiResolver != nil && p.multiResolver.Supports(host) {
-		newHost, err := p.multiResolver.ResolveToADNL(host)
+		newHost, err := p.multiResolver.ResolveToHost(host)
 		if err != nil {
 			http.Error(wr, fmt.Sprintf("Failed to resolve %s: %v", host, err), http.StatusBadGateway)
 			return
 		}
-		log.Debug().Str("domain", host).Str("adnl", newHost).Msg("multi-chain resolved")
+		log.Debug().Str("domain", host).Str("target", newHost).Msg("multi-chain resolved")
 		// Keep the original Host header (e.g. "tonnet.eth") so the remote
 		// server's nginx can match its server_name. Only rewrite URL.Host
-		// so the RLDP transport routes to the correct .adnl address.
+		// so the TON transport routes to the correct .adnl or .bag destination.
 		req.URL.Host = newHost
 	}
 
@@ -145,7 +145,7 @@ func (p *proxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 	urlHost := req.URL.Host
 	if strings.HasSuffix(req.Host, ".ton") || strings.HasSuffix(req.Host, ".adnl") ||
 		strings.HasSuffix(req.Host, ".t.me") || strings.HasSuffix(req.Host, ".bag") ||
-		strings.HasSuffix(urlHost, ".adnl") {
+		strings.HasSuffix(urlHost, ".adnl") || strings.HasSuffix(urlHost, ".bag") {
 		log.Debug().Str("method", req.Method).Str("url", req.URL.String()).Msg("over rldp")
 		// proxy requests to ton using special client
 		c = client

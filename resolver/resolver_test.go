@@ -195,7 +195,7 @@ func TestResolveToADNLCacheExpiry(t *testing.T) {
 	// Inject an expired cache entry
 	m.cacheMu.Lock()
 	m.cacheMap["example.test"] = cacheEntry{
-		adnlHost:  "expired.adnl",
+		host:      "expired.adnl",
 		expiresAt: time.Now().Add(-time.Minute),
 	}
 	m.cacheMu.Unlock()
@@ -250,5 +250,75 @@ func TestResolveToADNLErrorFromResolver(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "resolution failed") {
 		t.Errorf("expected propagated error, got: %v", err)
+	}
+}
+
+type mockSiteResolver struct {
+	mockResolver
+	target    SiteTarget
+	siteErr   error
+	siteCalls int
+}
+
+func (r *mockSiteResolver) ResolveSite(string) (SiteTarget, error) {
+	r.siteCalls++
+	return r.target, r.siteErr
+}
+
+func TestResolveToHostStorageCache(t *testing.T) {
+	m := NewMultiResolver()
+	defer m.Close()
+	const bagID = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+	id, err := ParseADNLAddress(bagID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mock := &mockSiteResolver{target: SiteTarget{Codec: MulticodecTONStorage, ID: id}}
+	m.Register(".eth", mock)
+
+	for i := 0; i < 2; i++ {
+		host, err := m.ResolveToHost("site.eth")
+		if err != nil || host != bagID+".bag" {
+			t.Fatalf("host = %q, err = %v", host, err)
+		}
+	}
+	if host, err := m.ResolveToADNL("site.eth"); err == nil || host != "" {
+		t.Fatalf("cached storage treated as ADNL: host=%q, err=%v", host, err)
+	}
+	if mock.siteCalls != 1 || mock.calls != 0 {
+		t.Fatalf("typed calls = %d, legacy calls = %d", mock.siteCalls, mock.calls)
+	}
+
+	m.cacheMu.Lock()
+	m.cacheMap["site.eth"] = cacheEntry{host: bagID + ".bag", expiresAt: time.Now().Add(-time.Minute)}
+	m.cacheMu.Unlock()
+	mock.target.Codec = MulticodecADNL
+	host, err := m.ResolveToHost("site.eth")
+	if err != nil || !strings.HasSuffix(host, ".adnl") || mock.siteCalls != 2 {
+		t.Fatalf("expired cache did not refresh target kind: host=%q, calls=%d, err=%v", host, mock.siteCalls, err)
+	}
+}
+
+func TestResolveToHostRejectsInvalidTargets(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mock mockSiteResolver
+	}{
+		{name: "unknown codec", mock: mockSiteResolver{target: SiteTarget{Codec: 0xe3}}},
+		{name: "resolver error", mock: mockSiteResolver{siteErr: fmt.Errorf("resolution failed")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := NewMultiResolver()
+			defer m.Close()
+			m.Register(".eth", &tc.mock)
+			for i := 0; i < 2; i++ {
+				if host, err := m.ResolveToHost("site.eth"); err == nil || host != "" {
+					t.Fatalf("invalid target accepted: host=%q, err=%v", host, err)
+				}
+			}
+			if tc.mock.siteCalls != 2 {
+				t.Fatal("resolution error was cached")
+			}
+		})
 	}
 }

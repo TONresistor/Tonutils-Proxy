@@ -30,6 +30,15 @@ type Resolver interface {
 	Close()
 }
 
+type SiteTarget struct {
+	Codec uint64
+	ID    [32]byte
+}
+
+type siteResolver interface {
+	ResolveSite(domain string) (SiteTarget, error)
+}
+
 // ChainConfig describes a blockchain name service that can be resolved.
 type ChainConfig struct {
 	TLD         string
@@ -54,7 +63,7 @@ func AllChains() []ChainConfig {
 }
 
 type cacheEntry struct {
-	adnlHost  string
+	host      string
 	expiresAt time.Time
 }
 
@@ -228,14 +237,42 @@ func SerializeADNLAddress(addr []byte) (string, error) {
 	return strings.ToLower(base32.StdEncoding.EncodeToString(append(a, crcBytes...))[1:]), nil
 }
 
-// ResolveToADNL resolves a multi-chain domain to a routable ".adnl" hostname.
-func (m *MultiResolver) ResolveToADNL(domain string) (string, error) {
+func (m *MultiResolver) resolveSite(domain string) (SiteTarget, error) {
+	for tld, r := range m.resolvers {
+		if !strings.HasSuffix(domain, tld) {
+			continue
+		}
+		if sr, ok := r.(siteResolver); ok {
+			return sr.ResolveSite(domain)
+		}
+		rawHex, err := r.Resolve(domain)
+		if err != nil {
+			return SiteTarget{}, err
+		}
+		rawHex = strings.TrimPrefix(strings.TrimPrefix(rawHex, "0x"), "0X")
+		id, err := hex.DecodeString(rawHex)
+		if err != nil {
+			return SiteTarget{}, fmt.Errorf("invalid ADNL hex for %s: %w", domain, err)
+		}
+		var target SiteTarget
+		if len(id) != len(target.ID) {
+			return SiteTarget{}, fmt.Errorf("invalid ADNL address for %s: expected %d bytes, got %d", domain, len(target.ID), len(id))
+		}
+		target.Codec = MulticodecADNL
+		copy(target.ID[:], id)
+		return target, nil
+	}
+	return SiteTarget{}, fmt.Errorf("no resolver for domain: %s", domain)
+}
+
+// ResolveToHost resolves a multi-chain domain to a routable .adnl or .bag hostname.
+func (m *MultiResolver) ResolveToHost(domain string) (string, error) {
 	m.cacheMu.RLock()
 	entry, ok := m.cacheMap[domain]
 	m.cacheMu.RUnlock()
 	if ok {
 		if time.Now().Before(entry.expiresAt) {
-			return entry.adnlHost, nil
+			return entry.host, nil
 		}
 		m.cacheMu.Lock()
 		if e, still := m.cacheMap[domain]; still && time.Now().After(e.expiresAt) {
@@ -244,35 +281,46 @@ func (m *MultiResolver) ResolveToADNL(domain string) (string, error) {
 		m.cacheMu.Unlock()
 	}
 
-	rawHex, err := m.Resolve(domain)
+	target, err := m.resolveSite(domain)
 	if err != nil {
 		return "", err
 	}
 
-	rawHex = strings.TrimPrefix(strings.TrimPrefix(rawHex, "0x"), "0X")
-	adnlBytes, err := hex.DecodeString(rawHex)
-	if err != nil {
-		return "", fmt.Errorf("invalid ADNL hex for %s: %w", domain, err)
-	}
-	if len(adnlBytes) != ADNLAddressSize {
-		return "", fmt.Errorf("invalid ADNL address for %s: expected %d bytes, got %d", domain, ADNLAddressSize, len(adnlBytes))
+	var host string
+	switch target.Codec {
+	case MulticodecADNL:
+		b32, err := SerializeADNLAddress(target.ID[:])
+		if err != nil {
+			return "", fmt.Errorf("encode ADNL address for %s: %w", domain, err)
+		}
+		host = b32 + adnlDomainSuffix
+	case MulticodecTONStorage:
+		host = hex.EncodeToString(target.ID[:]) + ".bag"
+	default:
+		return "", fmt.Errorf("unsupported site codec %#x for %s", target.Codec, domain)
 	}
 
-	b32, err := SerializeADNLAddress(adnlBytes)
-	if err != nil {
-		return "", fmt.Errorf("encode ADNL address for %s: %w", domain, err)
-	}
-
-	adnlHost := b32 + adnlDomainSuffix
 	m.cacheMu.Lock()
 	m.evictIfNeeded()
 	m.cacheMap[domain] = cacheEntry{
-		adnlHost:  adnlHost,
+		host:      host,
 		expiresAt: time.Now().Add(resolveCacheTTL),
 	}
 	m.cacheMu.Unlock()
 
-	return adnlHost, nil
+	return host, nil
+}
+
+// ResolveToADNL resolves a multi-chain domain to a routable ".adnl" hostname.
+func (m *MultiResolver) ResolveToADNL(domain string) (string, error) {
+	host, err := m.ResolveToHost(domain)
+	if err != nil {
+		return "", err
+	}
+	if !strings.HasSuffix(host, adnlDomainSuffix) {
+		return "", fmt.Errorf("%q resolves to TON Storage, not ADNL", domain)
+	}
+	return host, nil
 }
 
 // ParseADNLAddress parses a hex string into a 32-byte ADNL address.

@@ -39,53 +39,70 @@ func newENSResolver(rpcURL string) (*ENSResolver, error) {
 }
 
 func (r *ENSResolver) Resolve(domain string) (string, error) {
+	target, err := r.ResolveSite(domain)
+	if err != nil {
+		return "", err
+	}
+	if target.Codec != MulticodecADNL {
+		return "", fmt.Errorf("%q resolves to TON Storage, not ADNL", domain)
+	}
+	return fmt.Sprintf("%x", target.ID), nil
+}
+
+func (r *ENSResolver) ResolveSite(domain string) (SiteTarget, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	type result struct {
-		addr string
-		err  error
+		target SiteTarget
+		err    error
 	}
 	ch := make(chan result, 1)
 
 	go func() {
 		normalized, err := ens.Normalize(domain)
 		if err != nil {
-			ch <- result{"", fmt.Errorf("normalize %q: %w", domain, err)}
+			ch <- result{SiteTarget{}, fmt.Errorf("normalize %q: %w", domain, err)}
 			return
 		}
 
 		resolver, err := ens.NewResolver(r.client, normalized)
 		if err != nil {
-			ch <- result{"", fmt.Errorf("ENS resolver for %q: %w", domain, err)}
+			ch <- result{SiteTarget{}, fmt.Errorf("ENS resolver for %q: %w", domain, err)}
 			return
 		}
 
-		// Preferred: ENSIP-7 contenthash carrying the official ADNL multicodec (0xb69910).
-		if raw, chErr := resolver.Contenthash(); chErr == nil && len(raw) > 0 {
-			if hexAdnl, ok, extractErr := ExtractADNLFromContenthash(raw); extractErr == nil && ok {
-				ch <- result{hexAdnl, nil}
-				return
-			}
-		}
-
-		// Backward-compatible fallback: legacy "adnl" text record (pre-ENSIP-7 setups).
-		if adnlAddr, txtErr := resolver.Text(ADNLRecordKey); txtErr == nil && adnlAddr != "" {
-			if _, parseErr := ParseADNLAddress(adnlAddr); parseErr == nil {
-				ch <- result{adnlAddr, nil}
-				return
-			}
-		}
-
-		ch <- result{"", fmt.Errorf("no ADNL contenthash (adnl multicodec) or %q text record for %q", ADNLRecordKey, domain)}
+		target, err := resolveENSRecords(resolver, domain)
+		ch <- result{target, err}
 	}()
 
 	select {
 	case res := <-ch:
-		return res.addr, res.err
+		return res.target, res.err
 	case <-ctx.Done():
-		return "", fmt.Errorf("resolve timeout for %q", domain)
+		return SiteTarget{}, fmt.Errorf("resolve timeout for %q", domain)
 	}
+}
+
+type ensRecords interface {
+	Contenthash() ([]byte, error)
+	Text(string) (string, error)
+}
+
+func resolveENSRecords(records ensRecords, domain string) (SiteTarget, error) {
+	if raw, err := records.Contenthash(); err == nil && len(raw) > 0 {
+		if target, ok, err := ExtractSiteFromContenthash(raw); err == nil && ok {
+			return target, nil
+		}
+	}
+
+	// Backward-compatible fallback: legacy "adnl" text record (pre-ENSIP-7 setups).
+	if raw, err := records.Text(ADNLRecordKey); err == nil && raw != "" {
+		if id, err := ParseADNLAddress(raw); err == nil {
+			return SiteTarget{Codec: MulticodecADNL, ID: id}, nil
+		}
+	}
+	return SiteTarget{}, fmt.Errorf("no ADNL or TON Storage contenthash or %q text record for %q", ADNLRecordKey, domain)
 }
 
 func (r *ENSResolver) Close() {

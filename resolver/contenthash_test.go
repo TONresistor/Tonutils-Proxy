@@ -137,3 +137,46 @@ func TestExtractADNLFromContenthash_TonnetGolden(t *testing.T) {
 		t.Fatalf("ADNL hex = %q, want %q", got, wantADNLHex)
 	}
 }
+
+func TestExtractSiteFromContenthash(t *testing.T) {
+	const id = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+	for _, tc := range []struct {
+		name    string
+		raw     string
+		codec   uint64
+		wantErr bool
+	}{
+		{name: "ADNL", raw: "90b2da05" + id, codec: MulticodecADNL},
+		{name: "TON Storage", raw: "90b2de05" + id, codec: MulticodecTONStorage},
+		{name: "unknown codec", raw: "12" + id},
+		{name: "empty", wantErr: true},
+		{name: "invalid varint", raw: "ffffffffffffffffffff", wantErr: true},
+		{name: "short ADNL", raw: "90b2da05" + id[2:], wantErr: true},
+		{name: "short bag ID", raw: "90b2de05" + id[2:], wantErr: true},
+		{name: "long bag ID", raw: "90b2de05" + id + "00", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := hex.DecodeString(tc.raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			target, ok, err := ExtractSiteFromContenthash(raw)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("error = %v, want error = %v", err, tc.wantErr)
+			}
+			if ok != (tc.codec != 0) {
+				t.Fatalf("supported = %v, want codec %#x", ok, tc.codec)
+			}
+			if ok && (target.Codec != tc.codec || hex.EncodeToString(target.ID[:]) != id) {
+				t.Fatalf("target = %#x/%x, want %#x/%s", target.Codec, target.ID, tc.codec, id)
+			}
+		})
+	}
+}
+
+func TestExtractADNLFromContenthashRejectsStorage(t *testing.T) {
+	raw := EncodeContenthash(MulticodecTONStorage, make([]byte, 32))
+	if value, ok, err := ExtractADNLFromContenthash(raw); value != "" || ok || err != nil {
+		t.Fatalf("storage treated as ADNL: value=%q, ok=%v, err=%v", value, ok, err)
+	}
+}
